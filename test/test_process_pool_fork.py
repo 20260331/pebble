@@ -15,7 +15,7 @@ from concurrent.futures.process import BrokenProcessPool
 from concurrent.futures import CancelledError, TimeoutError
 
 import pebble
-from pebble import ProcessPool, ProcessExpired
+from pebble import ProcessPool, ProcessExpired, PoolFullError
 from pebble.pool.base_pool import PoolStatus
 
 
@@ -111,6 +111,15 @@ def sigterm_function():
 
 def suicide_function():
     os._exit(1)
+
+
+process_map_gate = None
+
+
+def gated_process_map_function(value):
+    """Map worker blocked until the test opens the multiprocessing gate."""
+    process_map_gate.wait()
+    return value
 
 
 def process_function():
@@ -927,3 +936,226 @@ class TestProcessPoolDeadlockOnCancelLargeData(unittest.TestCase):
             for f in futures:
                 f.cancel()
             pool.stop()
+
+
+@unittest.skipIf(not supported, "Start method is not supported")
+class TestProcessPoolTaskBudget(unittest.TestCase):
+    """Pool-wide unfinished task budget."""
+
+    def setUp(self):
+        global process_map_gate
+        process_map_gate = mp_context.Event()
+
+    def test_invalid_budget(self):
+        """Negative budgets are rejected."""
+        with self.assertRaises(ValueError):
+            ProcessPool(max_unfinished_tasks=-1, context=mp_context)
+
+    def test_unlimited_budget_by_default(self):
+        """No budget is enforced unless explicitly configured."""
+        with ProcessPool(max_workers=1, context=mp_context) as pool:
+            self.assertFalse(pool._context.budget.limited)
+
+    def test_reject_when_full(self):
+        """block=False raises PoolFullError once the budget is exhausted."""
+        with ProcessPool(
+            max_workers=1, max_unfinished_tasks=2, block=False, context=mp_context
+        ) as pool:
+            pool.schedule(long_function)
+            pool.schedule(long_function)
+            with self.assertRaises(PoolFullError):
+                pool.schedule(long_function)
+
+    def test_slot_returned_after_completion(self):
+        """A finished task frees a slot for a new admission."""
+        with ProcessPool(
+            max_workers=1, max_unfinished_tasks=1, block=False, context=mp_context
+        ) as pool:
+            self.assertEqual(pool.schedule(function, args=[1]).result(), 1)
+            self.assertEqual(pool.schedule(function, args=[2]).result(), 2)
+
+    def test_reject_shared_by_submit(self):
+        """submit accounts against the same budget as schedule."""
+        with ProcessPool(
+            max_workers=1, max_unfinished_tasks=1, block=False, context=mp_context
+        ) as pool:
+            pool.submit(long_function, None)
+            with self.assertRaises(PoolFullError):
+                pool.submit(long_function, None)
+
+    def test_block_waits_for_slot(self):
+        """block=True waits instead of rejecting once the budget is full."""
+        result = []
+
+        def waiter():
+            result.append(pool.schedule(function, args=[1]).result())
+
+        with ProcessPool(
+            max_workers=1, max_unfinished_tasks=1, context=mp_context
+        ) as pool:
+            first = pool.schedule(long_function, args=[0.5])
+            thread = threading.Thread(target=waiter)
+            thread.start()
+            time.sleep(0.2)
+            self.assertTrue(thread.is_alive())  # blocked on the budget
+            thread.join(3)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(result, [1])
+        self.assertEqual(first.result(), 0.5)
+
+    def test_timeout_returns_slot(self):
+        """A timed out task returns its slot."""
+        with ProcessPool(
+            max_workers=1, max_unfinished_tasks=1, block=False, context=mp_context
+        ) as pool:
+            with self.assertRaises(TimeoutError):
+                pool.schedule(long_function, timeout=0.1).result()
+
+            self.assertEqual(pool.schedule(function, args=[1]).result(), 1)
+
+    def test_pickling_error_returns_slot(self):
+        """A task failing serialization returns its slot."""
+        with ProcessPool(
+            max_workers=1, max_unfinished_tasks=1, block=False, context=mp_context
+        ) as pool:
+            with self.assertRaises((pickle.PicklingError, TypeError)):
+                pool.schedule(function, args=[threading.Lock()]).result()
+
+            self.assertEqual(pool.schedule(function, args=[1]).result(), 1)
+
+    def test_worker_expiration_returns_slot(self):
+        """A task whose worker dies abnormally returns its slot."""
+        with ProcessPool(
+            max_workers=1, max_unfinished_tasks=1, block=False, context=mp_context
+        ) as pool:
+            with self.assertRaises(ProcessExpired):
+                pool.schedule(suicide_function).result()
+
+            self.assertEqual(pool.schedule(function, args=[1]).result(), 1)
+
+    def test_cancel_returns_slot(self):
+        """A cancelled task returns its slot."""
+        with ProcessPool(
+            max_workers=1, max_unfinished_tasks=1, block=False, context=mp_context
+        ) as pool:
+            future = pool.schedule(long_function)
+            time.sleep(0.1)  # let the worker pick up the task
+            self.assertTrue(future.cancel())
+            with self.assertRaises(CancelledError):
+                future.result()
+
+            self.assertEqual(pool.schedule(function, args=[1]).result(), 1)
+
+    def test_queued_cancel_returns_slot(self):
+        """Cancelling a task still in the queue returns its slot."""
+        with ProcessPool(
+            max_workers=1, max_unfinished_tasks=2, block=False, context=mp_context
+        ) as pool:
+            running = pool.schedule(long_function)
+            queued = pool.schedule(long_function)
+            with self.assertRaises(PoolFullError):
+                pool.schedule(long_function)
+
+            self.assertTrue(queued.cancel())
+            self.assertEqual(pool.schedule(function, args=[1]).result(), 1)
+            running.result()
+
+    def test_stop_returns_stranded_slots(self):
+        """stop returns queued and running slots back to the budget."""
+        pool = ProcessPool(
+            max_workers=1, max_unfinished_tasks=3, block=False, context=mp_context
+        )
+        for _ in range(3):
+            pool.schedule(long_function)
+        with self.assertRaises(PoolFullError):
+            pool.schedule(long_function)
+
+        pool.stop()
+        pool.join()
+
+        self.assertEqual(pool._context.budget._semaphore._value, 3)
+
+    def test_decorator_shares_budget(self):
+        """concurrent.process tasks created via a pool share its budget."""
+        with ProcessPool(
+            max_workers=1, max_unfinished_tasks=1, block=False, context=mp_context
+        ) as pool:
+
+            @pebble.concurrent.process(pool=pool)
+            def decorated():
+                return 1
+
+            first = decorated()
+            with self.assertRaises(PoolFullError):
+                decorated()
+
+            self.assertEqual(first.result(), 1)
+            self.assertEqual(decorated().result(), 1)
+
+    def test_map_processes_all_within_budget(self):
+        """map completes inputs larger than the budget."""
+        with ProcessPool(
+            max_workers=2, max_unfinished_tasks=3, context=mp_context
+        ) as pool:
+            self.assertEqual(
+                list(pool.map(function, range(20)).result()), list(range(20))
+            )
+
+    def test_map_on_rejecting_pool_backpressures(self):
+        """map waits for slots even on pools configured to reject."""
+        with ProcessPool(
+            max_workers=1, max_unfinished_tasks=2, block=False, context=mp_context
+        ) as pool:
+            self.assertEqual(
+                list(pool.map(function, range(15)).result()), list(range(15))
+            )
+
+    def test_map_does_not_prefetch_beyond_budget(self):
+        """Lazy inputs are pulled only as budget slots allow."""
+        pulled = []
+
+        def tracking():
+            for index in range(30):
+                pulled.append(index)
+                yield index
+
+        with ProcessPool(
+            max_workers=1, max_unfinished_tasks=2, context=mp_context
+        ) as pool:
+            iterator = pool.map(
+                gated_process_map_function, tracking()
+            ).result()
+            time.sleep(0.5)
+            # two chunks admitted, the third is pulled while waiting for a slot
+            self.assertEqual(pulled, [0, 1, 2])
+
+            process_map_gate.set()
+            self.assertEqual(list(iterator), list(range(30)))
+
+        self.assertEqual(pulled, list(range(30)))
+
+    def test_map_cancel_stops_input_consumption(self):
+        """Cancelling a map stops the feeder from pulling more input."""
+        pulled = []
+
+        def tracking():
+            for index in range(50):
+                pulled.append(index)
+                yield index
+
+        with ProcessPool(
+            max_workers=1, max_unfinished_tasks=2, context=mp_context
+        ) as pool:
+            map_future = pool.map(gated_process_map_function, tracking())
+            iterator = map_future.result()
+            time.sleep(0.5)
+            self.assertEqual(pulled, [0, 1, 2])
+
+            map_future.cancel()
+            process_map_gate.set()
+
+            with self.assertRaises(CancelledError):
+                list(iterator)
+
+        self.assertLess(len(pulled), 50)

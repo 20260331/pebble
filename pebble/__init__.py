@@ -14,6 +14,7 @@ __all__ = [
     "MapFuture",
     "ProcessMapFuture",
     "ProcessExpired",
+    "PoolFullError",
     "ProcessPool",
     "ThreadPool",
     "CONSTS",
@@ -25,3 +26,4 @@ from pebble.decorators import synchronized, sighandler
 from pebble.functions import waitforqueues, waitforthreads
 from pebble.common import ProcessExpired, ProcessFuture, CONSTS
 from pebble.pool import ThreadPool, ProcessPool, MapFuture, ProcessMapFuture
+from pebble.pool.base_pool import PoolFullError

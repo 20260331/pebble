@@ -3,14 +3,28 @@ import asyncio
 import unittest
 import threading
 import dataclasses
+import itertools
 
 from unittest import mock
 from concurrent.futures import CancelledError, TimeoutError
 
-from pebble import ThreadPool
+from pebble import ThreadPool, PoolFullError, concurrent
 from pebble.pool.base_pool import PoolStatus
 
 initarg = 0
+
+map_gate = threading.Event()
+
+
+def gated_map_function(value):
+    """Map worker blocked until the test opens the gate."""
+    map_gate.wait()
+    return value
+
+
+def gated_function(event, value=0):
+    event.wait()
+    return value
 
 
 def error_callback(future):
@@ -502,3 +516,214 @@ class TestAsyncIOThreadPool(unittest.TestCase):
         with ThreadPool(max_workers=1) as pool:
             asyncio.run(test(pool))
             self.assertTrue(isinstance(self.exception, asyncio.CancelledError))
+
+
+class TestThreadPoolTaskBudget(unittest.TestCase):
+    """Pool-wide unfinished task budget."""
+
+    def setUp(self):
+        map_gate.clear()
+
+    def test_invalid_budget(self):
+        """Negative budgets are rejected."""
+        with self.assertRaises(ValueError):
+            ThreadPool(max_unfinished_tasks=-1)
+
+    def test_unlimited_budget_by_default(self):
+        """No budget is enforced unless explicitly configured."""
+        with ThreadPool(max_workers=1) as pool:
+            self.assertFalse(pool._context.budget.limited)
+
+    def test_reject_when_full(self):
+        """block=False raises PoolFullError once the budget is exhausted."""
+        with ThreadPool(max_workers=1, max_unfinished_tasks=2, block=False) as pool:
+            pool.schedule(long_function)
+            pool.schedule(long_function)
+            with self.assertRaises(PoolFullError):
+                pool.schedule(long_function)
+
+    def test_slot_returned_after_completion(self):
+        """A finished task frees a slot for a new admission."""
+        with ThreadPool(max_workers=1, max_unfinished_tasks=1, block=False) as pool:
+            self.assertEqual(pool.schedule(function, args=[1]).result(), 1)
+            self.assertEqual(pool.schedule(function, args=[2]).result(), 2)
+
+    def test_reject_shared_by_submit(self):
+        """submit accounts against the same budget as schedule."""
+        with ThreadPool(max_workers=1, max_unfinished_tasks=1, block=False) as pool:
+            pool.submit(long_function)
+            with self.assertRaises(PoolFullError):
+                pool.submit(long_function)
+
+    def test_block_waits_for_slot(self):
+        """block=True waits instead of rejecting once the budget is full."""
+        event = threading.Event()
+        result = []
+
+        def waiter():
+            result.append(pool.schedule(function, args=[1]).result())
+
+        with ThreadPool(max_workers=1, max_unfinished_tasks=1) as pool:
+            first = pool.schedule(gated_function, args=(event,))
+            thread = threading.Thread(target=waiter)
+            thread.start()
+            time.sleep(0.3)
+            self.assertTrue(thread.is_alive())  # blocked on the budget
+            event.set()
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(result, [1])
+        self.assertEqual(first.result(), 0)
+
+    def test_concurrent_rejections_match_overflow(self):
+        """Concurrent admissions never hand out more slots than the budget."""
+        barrier = threading.Barrier(8)
+        outcomes = []
+
+        def client():
+            barrier.wait()
+            try:
+                future = pool.schedule(tid_function)
+                outcomes.append(("ok", future))
+            except PoolFullError:
+                outcomes.append(("full", None))
+
+        with ThreadPool(max_workers=2, max_unfinished_tasks=3, block=False) as pool:
+            threads = [threading.Thread(target=client) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(len([o for o in outcomes if o[0] == "ok"]), 3)
+        self.assertEqual(len([o for o in outcomes if o[0] == "full"]), 5)
+        for kind, future in outcomes:
+            if kind == "ok":
+                future.result()
+
+    def test_queued_cancel_returns_slot(self):
+        """Cancelling a queued task returns its slot immediately."""
+        with ThreadPool(max_workers=1, max_unfinished_tasks=2, block=False) as pool:
+            running = pool.schedule(long_function)
+            queued = pool.schedule(long_function)
+            with self.assertRaises(PoolFullError):
+                pool.schedule(long_function)
+
+            self.assertTrue(queued.cancel())
+            admitted = pool.schedule(function, args=[1])
+            self.assertEqual(admitted.result(), 1)
+            running.result()
+
+    def test_stop_returns_stranded_slots(self):
+        """stop returns the slots of tasks no worker will ever consume."""
+        pool = ThreadPool(max_workers=1, max_unfinished_tasks=3, block=False)
+        for _ in range(3):
+            pool.schedule(long_function)
+        with self.assertRaises(PoolFullError):
+            pool.schedule(long_function)
+
+        pool.stop()
+        pool.join()
+
+        self.assertEqual(pool._context.budget._semaphore._value, 3)
+
+    def test_close_join_returns_all_slots(self):
+        """All slots are back once a closed pool is joined."""
+        pool = ThreadPool(max_workers=2, max_unfinished_tasks=4, block=False)
+        for index in range(4):
+            pool.schedule(function, args=[index])
+
+        pool.close()
+        pool.join()
+
+        self.assertEqual(pool._context.budget._semaphore._value, 4)
+
+    def test_decorator_shares_budget(self):
+        """concurrent.thread tasks created via a pool share its budget."""
+        with ThreadPool(max_workers=1, max_unfinished_tasks=1, block=False) as pool:
+
+            @concurrent.thread(pool=pool)
+            def decorated():
+                return 1
+
+            first = decorated()
+            with self.assertRaises(PoolFullError):
+                decorated()
+
+            self.assertEqual(first.result(), 1)
+            self.assertEqual(decorated().result(), 1)
+
+    def test_map_processes_all_within_budget(self):
+        """map completes inputs larger than the budget."""
+        with ThreadPool(max_workers=2, max_unfinished_tasks=3) as pool:
+            self.assertEqual(
+                list(pool.map(function, range(20)).result()), list(range(20))
+            )
+
+    def test_map_on_rejecting_pool_backpressures(self):
+        """map never rejects: the feeder waits for slots on blocking pools."""
+        with ThreadPool(max_workers=1, max_unfinished_tasks=2, block=False) as pool:
+            self.assertEqual(
+                list(pool.map(function, range(15)).result()), list(range(15))
+            )
+
+            first = pool.schedule(long_function)
+            pool.schedule(long_function)
+            with self.assertRaises(PoolFullError):
+                pool.schedule(long_function)
+            first.result()
+
+    def test_map_does_not_prefetch_beyond_budget(self):
+        """Lazy inputs are pulled only as budget slots allow."""
+        pulled = []
+
+        def tracking():
+            for index in range(30):
+                pulled.append(index)
+                yield index
+
+        with ThreadPool(max_workers=1, max_unfinished_tasks=2) as pool:
+            iterator = pool.map(gated_map_function, tracking()).result()
+            time.sleep(0.3)
+            # two chunks admitted, the third is pulled while waiting for a slot
+            self.assertEqual(pulled, [0, 1, 2])
+
+            map_gate.set()
+            self.assertEqual(list(iterator), list(range(30)))
+
+        self.assertEqual(pulled, list(range(30)))
+
+    def test_map_lazy_infinite_input(self):
+        """An infinite iterable cannot be prefetched into memory."""
+        with ThreadPool(max_workers=1, max_unfinished_tasks=2) as pool:
+            map_future = pool.map(gated_map_function, itertools.count())
+            iterator = map_future.result()
+            time.sleep(0.3)
+
+            map_gate.set()
+            self.assertEqual([next(iterator) for _ in range(5)], [0, 1, 2, 3, 4])
+            map_future.cancel()
+
+    def test_map_cancel_stops_input_consumption(self):
+        """Cancelling a map stops the feeder from pulling more input."""
+        pulled = []
+
+        def tracking():
+            for index in range(50):
+                pulled.append(index)
+                yield index
+
+        with ThreadPool(max_workers=1, max_unfinished_tasks=2) as pool:
+            map_future = pool.map(gated_map_function, tracking())
+            iterator = map_future.result()
+            time.sleep(0.3)
+            self.assertEqual(pulled, [0, 1, 2])
+
+            map_future.cancel()
+            map_gate.set()
+
+            with self.assertRaises(CancelledError):
+                list(iterator)
+
+        self.assertLess(len(pulled), 50)

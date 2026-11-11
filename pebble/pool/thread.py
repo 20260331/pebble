@@ -23,13 +23,13 @@ from queue import Queue
 from itertools import count
 from threading import Thread
 from concurrent.futures import Future
-from typing import Any, Callable, Mapping, Iterable, List
+from typing import Any, Callable, Mapping, Iterable
 
 from pebble.common import ResultStatus, execute, launch_thread, CONSTS
 from pebble.common.types import P, T
-from pebble.pool.base_pool import iter_chunks, run_initializer
+from pebble.pool.base_pool import run_initializer, drain_pending_tasks
 from pebble.pool.base_pool import MapResults, Worker, Result
-from pebble.pool.base_pool import PoolStatus, MapFuture, map_results
+from pebble.pool.base_pool import PoolStatus, MapFuture
 from pebble.pool.base_pool import PoolContext, BasePool, Task, TaskPayload
 
 
@@ -44,6 +44,11 @@ class ThreadPool(BasePool):
     initializer must be callable, if passed, it will be called
     every time a worker is started, receiving initargs as arguments.
 
+    max_unfinished_tasks limits the amount of tasks admitted by the Pool
+    (queued and running). If zero, the amount of unfinished tasks is unlimited.
+    If block is True, scheduling calls wait for a free slot, otherwise
+    a PoolFullError is raised once the budget is exhausted.
+
     """
 
     def __init__(
@@ -52,8 +57,17 @@ class ThreadPool(BasePool):
         max_tasks: int = 0,
         initializer: Callable | None = None,
         initargs: Iterable[Any] = (),
+        max_unfinished_tasks: int = 0,
+        block: bool = True,
     ):
-        super().__init__(max_workers, max_tasks, initializer, initargs)
+        super().__init__(
+            max_workers,
+            max_tasks,
+            initializer,
+            initargs,
+            max_unfinished_tasks,
+            block,
+        )
         self._pool_manager: PoolManager = PoolManager(self._context)
         self._pool_manager_loop: Thread | None = None
 
@@ -87,15 +101,43 @@ class ThreadPool(BasePool):
         A *concurrent.futures.Future* object is returned.
 
         """
-        self._check_pool_status()
+        return self._schedule(function, args, kwargs)
 
-        future: Future = Future()
-        payload: TaskPayload = TaskPayload(function, args, kwargs)
-        task: Task = Task(next(self._task_counter), future, None, payload)
+    def _schedule(
+        self,
+        function: Callable[..., T],
+        args: Iterable[Any],
+        kwargs: Mapping[str, Any],
+        blocking: bool | None = None,
+    ) -> Future[T]:
+        self._acquire_budget(blocking)
+        budget = self._context.budget
 
-        self._context.task_queue.put(task)
+        try:
+            self._check_pool_status()
+
+            future: Future = Future()
+            payload: TaskPayload = TaskPayload(function, args, kwargs)
+            task: Task = Task(next(self._task_counter), future, None, payload)
+            self._bind_budget(task)
+
+            self._context.task_queue.put(task)
+        except BaseException:
+            budget.release()
+            raise
 
         return future
+
+    def _schedule_map_chunk(
+        self,
+        chunk_runner: Callable,
+        function: Callable[..., T],
+        chunk: tuple,
+        timeout: float | None,
+    ) -> Future:
+        # The map feeder always applies backpressure even when the Pool
+        # is configured to reject tasks on a full budget.
+        return self._schedule(chunk_runner, (function, chunk), {}, blocking=True)
 
     def submit(
         self, function: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
@@ -121,19 +163,13 @@ class ThreadPool(BasePool):
         be broken into before being passed to the function. If None
         the size will be controlled by the Pool.
 
+        The input iterables are consumed lazily, the amount of chunks
+        scheduled ahead of time being bounded by the Pool task budget.
+
         """
-        self._check_pool_status()
-
-        if chunksize < 1:
-            raise ValueError("chunksize must be >= 1")
-
-        futures: List[Future] = [
-            self.schedule(process_chunk, args=(function, chunk))
-            for chunk in iter_chunks(zip(*iterables), chunksize)
-        ]
-        future: MapFuture = MapFuture(futures)
-
-        return map_results(future, timeout)
+        return self._pool_map(
+            function, iterables, timeout, chunksize, MapFuture, process_chunk
+        )
 
 
 def pool_manager_loop(pool_manager: PoolManager):
@@ -147,12 +183,14 @@ def pool_manager_loop(pool_manager: PoolManager):
 class PoolManager:
     def __init__(self, context: PoolContext):
         self.context: PoolContext = context
-        self.workers: List[Thread] = []
+        self.workers: list[Thread] = []
 
     def start(self):
         self.create_workers()
 
     def stop(self):
+        # Return the budget of the tasks the workers will never consume
+        drain_pending_tasks(self.context)
         for worker in self.workers:
             self.context.task_queue.put(None)
         for worker in tuple(self.workers):

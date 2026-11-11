@@ -31,13 +31,13 @@ from dataclasses import dataclass
 from multiprocessing.process import BaseProcess
 from concurrent.futures.process import BrokenProcessPool
 from concurrent.futures import CancelledError, TimeoutError
-from typing import Any, Callable, Dict, Mapping, Iterable, Iterator, List, Tuple
+from typing import Any, Callable, Dict, Mapping, Iterable, Iterator, Tuple
 
 from pebble.pool.channel import Channel, WorkerChannel, channels
-from pebble.pool.base_pool import Worker, iter_chunks, run_initializer
+from pebble.pool.base_pool import Worker, run_initializer, drain_pending_tasks
 from pebble.pool.base_pool import PoolContext, BasePool, Task, TaskPayload
 from pebble.pool.base_pool import MapResults
-from pebble.pool.base_pool import PoolStatus, ProcessMapFuture, map_results
+from pebble.pool.base_pool import PoolStatus, ProcessMapFuture
 from pebble.common import Result, ResultStatus, CONSTS
 from pebble.common import ProcessExpired, ProcessFuture
 from pebble.common.types import MultiprocessingContext, P, T
@@ -59,6 +59,11 @@ class ProcessPool(BasePool):
     The context parameter can be used to specify the multiprocessing module
     or the multiprocessing.context object used for starting the worker processes.
 
+    max_unfinished_tasks limits the amount of tasks admitted by the Pool
+    (queued and running). If zero, the amount of unfinished tasks is unlimited.
+    If block is True, scheduling calls wait for a free slot, otherwise
+    a PoolFullError is raised once the budget is exhausted.
+
     """
 
     def __init__(
@@ -68,8 +73,17 @@ class ProcessPool(BasePool):
         initializer: Callable | None = None,
         initargs: Iterable[Any] = (),
         context: MultiprocessingContext = multiprocessing,
+        max_unfinished_tasks: int = 0,
+        block: bool = True,
     ):
-        super().__init__(max_workers, max_tasks, initializer, initargs)
+        super().__init__(
+            max_workers,
+            max_tasks,
+            initializer,
+            initargs,
+            max_unfinished_tasks,
+            block,
+        )
         self._pool_manager: PoolManager = PoolManager(self._context, context)
         self._task_scheduler_loop: Thread | None = None
         self._pool_manager_loop: Thread | None = None
@@ -124,15 +138,46 @@ class ProcessPool(BasePool):
         A *pebble.ProcessFuture* object is returned.
 
         """
-        self._check_pool_status()
+        return self._schedule(function, args, kwargs, timeout)
 
-        future: ProcessFuture = ProcessFuture()
-        payload: TaskPayload = TaskPayload(function, args, kwargs)
-        task: Task = Task(next(self._task_counter), future, timeout, payload)
+    def _schedule(
+        self,
+        function: Callable[..., T],
+        args: Iterable[Any],
+        kwargs: Mapping[str, Any],
+        timeout: float | None,
+        blocking: bool | None = None,
+    ) -> ProcessFuture[T]:
+        self._acquire_budget(blocking)
+        budget = self._context.budget
 
-        self._context.task_queue.put(task)
+        try:
+            self._check_pool_status()
+
+            future: ProcessFuture = ProcessFuture()
+            payload: TaskPayload = TaskPayload(function, args, kwargs)
+            task: Task = Task(next(self._task_counter), future, timeout, payload)
+            self._bind_budget(task)
+
+            self._context.task_queue.put(task)
+        except BaseException:
+            budget.release()
+            raise
 
         return future
+
+    def _schedule_map_chunk(
+        self,
+        chunk_runner: Callable,
+        function: Callable[..., T],
+        chunk: tuple,
+        timeout: float | None,
+    ) -> ProcessFuture:
+        # The map feeder always applies backpressure even when the Pool
+        # is configured to reject tasks on a full budget.
+        return self._schedule(
+            chunk_runner, (function, chunk), {}, timeout, blocking=True
+        )
 
     def submit(
         self,
@@ -167,21 +212,15 @@ class ProcessPool(BasePool):
         *chunksize* controls the size of the chunks the iterable will
         be broken into before being passed to the function.
 
+        The input iterables are consumed lazily, the amount of chunks
+        scheduled ahead of time being bounded by the Pool task budget.
+
         A *pebble.ProcessFuture* object is returned.
 
         """
-        self._check_pool_status()
-
-        if chunksize < 1:
-            raise ValueError("chunksize must be >= 1")
-
-        futures: List[ProcessFuture] = [
-            self.schedule(process_chunk, args=(function, chunk), timeout=timeout)
-            for chunk in iter_chunks(zip(*iterables), chunksize)
-        ]
-        future: ProcessMapFuture = ProcessMapFuture(futures)
-
-        return map_results(future, timeout)
+        return self._pool_map(
+            function, iterables, timeout, chunksize, ProcessMapFuture, process_chunk
+        )
 
 
 def task_scheduler_loop(pool_manager: PoolManager):
@@ -235,8 +274,14 @@ class PoolManager:
         self.worker_manager.create_workers()
 
     def stop(self):
+        # Return the budget of the tasks the scheduler will never dispatch
+        drain_pending_tasks(self.context)
         self.worker_manager.close_channels()
         self.worker_manager.force_stop_workers()
+        # Registered tasks are terminated along with their workers,
+        # their Futures never reaching a terminal state
+        for task in dictionary_values(self.task_manager.tasks):
+            self.context.budget.release_task(task)
 
     def schedule(self, task: Task):
         """Schedules a new Task in the PoolManager."""

@@ -20,16 +20,27 @@ import time
 import logging
 import itertools
 
-from queue import Queue
+from queue import Queue, Empty
 from enum import IntEnum
-from threading import RLock
+from threading import RLock, Lock, Semaphore
 from dataclasses import dataclass
-from concurrent.futures import Future, TimeoutError
+from concurrent.futures import Future, TimeoutError, CancelledError
 from typing import Iterator, TypeVar, Mapping
 from typing import Any, Callable, Generic, Iterable
 
 from pebble.common.types import T
 from pebble.common import Result, ResultStatus, ProcessFuture, CONSTS
+from pebble.common import launch_thread
+
+
+class PoolFullError(RuntimeError):
+    """Raised when a task is scheduled while the Pool budget is full.
+
+    It is raised only by Pools configured with a finite
+    ``max_unfinished_tasks`` budget and ``block=False``.
+    Pools blocking on a full budget wait for a slot instead.
+
+    """
 
 
 class BasePool:
@@ -39,9 +50,16 @@ class BasePool:
         max_tasks: int,
         initializer: Callable | None,
         initargs: Iterable[Any],
+        max_unfinished_tasks: int = 0,
+        block: bool = True,
     ):
         self._context: PoolContext = PoolContext(
-            max_workers, max_tasks, initializer, initargs
+            max_workers,
+            max_tasks,
+            initializer,
+            initargs,
+            max_unfinished_tasks,
+            block,
         )
         self._loops: Iterable[Any] = ()
         self._task_counter: itertools.count = itertools.count()
@@ -113,6 +131,77 @@ class BasePool:
             if not loop.is_alive():
                 self._context.status = PoolStatus.ERROR
 
+    def _acquire_budget(self, blocking: bool | None = None):
+        """Admits a task against the pool-wide unfinished task budget.
+
+        Blocks or raises *PoolFullError* depending on the Pool configuration
+        unless a different *blocking* behaviour is requested (map feeder).
+
+        """
+        self._check_pool_status()
+        self._context.budget.acquire(blocking)
+
+    def _bind_budget(self, task: Task):
+        """Binds the task budget slot to the Future terminal state.
+
+        The slot is released exactly once no matter how the task terminates:
+        completion, error, cancellation, timeout, worker expiration or
+        pool shutdown.
+
+        """
+        task.future.add_done_callback(
+            lambda _future: self._context.budget.release_task(task)
+        )
+
+    def _pool_map(
+        self,
+        function: Callable[..., T],
+        iterables: tuple[Iterable[Any], ...],
+        timeout: float | None,
+        chunksize: int,
+        map_future_type: Callable[[], MapFutureT],
+        chunk_runner: Callable,
+    ) -> MapFutureT:
+        """Shared implementation of the Pool map method.
+
+        The input iterables are consumed lazily by a dedicated feeder thread
+        which schedules one chunk at a time, applying backpressure against
+        the admission budget instead of prefetching unbounded input.
+
+        """
+        self._check_pool_status()
+
+        if chunksize < 1:
+            raise ValueError("chunksize must be >= 1")
+
+        chunks: Iterator = iter_chunks(zip(*iterables), chunksize)
+        map_future: MapFutureT = map_future_type()
+        chunk_queue: Queue = Queue()
+        map_future.set_result(MapResults(chunk_queue, map_future, timeout))
+        launch_thread(
+            None,
+            map_feeder,
+            True,
+            self,
+            function,
+            chunks,
+            timeout,
+            map_future,
+            chunk_queue,
+            chunk_runner,
+        )
+
+        return map_future
+
+    def _schedule_map_chunk(
+        self,
+        chunk_runner: Callable,
+        function: Callable[..., T],
+        chunk: tuple,
+        timeout: float | None,
+    ) -> Future:
+        raise NotImplementedError("Not implemented")
+
     def _start_pool(self):
         raise NotImplementedError("Not implemented")
 
@@ -127,6 +216,8 @@ class PoolContext:
         max_tasks: int,
         initializer: Callable | None,
         initargs: Iterable[Any],
+        max_unfinished_tasks: int = 0,
+        block_on_full: bool = True,
     ):
         self._status: PoolStatus = PoolStatus.CREATED
         self.status_mutex: RLock = RLock()
@@ -135,6 +226,7 @@ class PoolContext:
         self.workers: int = max_workers
         self.task_counter: itertools.count = itertools.count()
         self.worker_parameters: Worker = Worker(max_tasks, initializer, initargs)
+        self.budget: TaskBudget = TaskBudget(max_unfinished_tasks, block_on_full)
 
     @property
     def status(self) -> PoolStatus:
@@ -165,6 +257,7 @@ class Task:
         self.payload: TaskPayload = payload
         self.timestamp: float = 0.0
         self.worker_id: int = 0
+        self.budget_released: bool = False
 
     @property
     def started(self) -> bool:
@@ -186,83 +279,178 @@ class Task:
 
 
 class MapFuture(Future[T]):
-    def __init__(self, futures: Iterable[Future[T]]):
+    def __init__(self):
         super().__init__()
-        self._futures: Iterable[Future[T]] = futures
+        self._futures: list[Future[T]] = []
+        self._futures_lock: Lock = Lock()
+        self._map_cancelled: bool = False
 
     @property
-    def futures(self) -> Iterable[Future[T]]:
-        return self._futures
+    def futures(self) -> tuple[Future[T], ...]:
+        with self._futures_lock:
+            return tuple(self._futures)
+
+    @property
+    def map_cancelled(self) -> bool:
+        return self._map_cancelled
+
+    def register(self, future: Future[T]):
+        """Registers a chunk Future scheduled by the map feeder."""
+        with self._futures_lock:
+            self._futures.append(future)
+        setattr(future, "map_future", self)
 
     def cancel(self) -> bool:
         """Cancel the future.
 
-        Returns True if any of the elements of the iterables is cancelled.
+        Stops the map feeder from consuming further input and cancels
+        all the scheduled chunk futures.
+
+        Returns True if any of the chunk futures is cancelled.
         False otherwise.
         """
-        super().cancel()
+        self._map_cancelled = True
 
-        return any(tuple(f.cancel() for f in self._futures))
+        with self._futures_lock:
+            return any(tuple(f.cancel() for f in self._futures))
 
 
 class ProcessMapFuture(ProcessFuture[T]):
-    def __init__(self, futures: Iterable[ProcessFuture[T]]):
+    def __init__(self):
         super().__init__()
-        self._futures: Iterable[ProcessFuture[T]] = futures
+        self._futures: list[ProcessFuture[T]] = []
+        self._futures_lock: Lock = Lock()
+        self._map_cancelled: bool = False
 
     @property
-    def futures(self) -> Iterable[ProcessFuture[T]]:
-        return self._futures
+    def futures(self) -> tuple[ProcessFuture[T], ...]:
+        with self._futures_lock:
+            return tuple(self._futures)
+
+    @property
+    def map_cancelled(self) -> bool:
+        return self._map_cancelled
+
+    def register(self, future: ProcessFuture[T]):
+        """Registers a chunk Future scheduled by the map feeder."""
+        with self._futures_lock:
+            self._futures.append(future)
+        setattr(future, "map_future", self)
 
     def cancel(self) -> bool:
         """Cancel the future.
 
-        Returns True if any of the elements of the iterables is cancelled.
+        Stops the map feeder from consuming further input and cancels
+        all the scheduled chunk futures.
+
+        Returns True if any of the chunk futures is cancelled.
         False otherwise.
         """
-        super().cancel()
+        self._map_cancelled = True
 
-        return any(tuple(f.cancel() for f in self._futures))
+        with self._futures_lock:
+            return any(tuple(f.cancel() for f in self._futures))
 
 
 class MapResults(Result[T]):
-    def __init__(self, futures: Iterable[Future], timeout: float | None = None):
-        self._results: Iterator[Result | Exception] = itertools.chain.from_iterable(
-            chunk_result(f, timeout) for f in futures
-        )
+    """Lazily consumes the chunk Futures produced by the map feeder."""
+
+    def __init__(
+        self,
+        chunk_queue: "Queue[Future | BaseException | None]",
+        map_future: MapFuture[Any] | ProcessMapFuture[Any],
+        timeout: float | None = None,
+    ):
+        self._chunk_queue: Queue[Future | BaseException | None] = chunk_queue
+        self._map_future: MapFuture[Any] | ProcessMapFuture[Any] = map_future
+        self._timeout: float | None = timeout
+        self._elements: Iterator[Any] = iter(())
+        self._cancelled: bool = False
 
     def __iter__(self) -> Iterator[T]:
         return self
 
     def next(self) -> T:
-        result: Result | Exception = next(self._results)
+        if self._cancelled:  # input not yet scheduled when the map was cancelled
+            raise CancelledError()
+
+        while True:
+            try:
+                result: Any = next(self._elements)
+                break
+            except StopIteration:
+                item = self._chunk_queue.get()
+
+                if item is None:  # map feeder exhausted the input
+                    if self._map_future.map_cancelled:
+                        self._cancelled = True
+                        raise CancelledError()
+                    raise
+                if isinstance(item, BaseException):  # feeder/scheduling error
+                    raise item
+
+                self._elements = iter(chunk_result(item, self._timeout))
 
         if isinstance(result, Result):
             if result.status == ResultStatus.SUCCESS:
                 return result.value
 
-            result = result.value
+            raise result.value
 
         raise result  # type: ignore[misc]
 
     __next__ = next
 
 
-def map_results(map_future: MapFutureType, timeout: float | None) -> MapFutureType:
-    futures: Iterable[Future] = map_future.futures
-    if not futures:
-        map_future.set_result(MapResults(futures))
-        return map_future
+def map_feeder(
+    pool: BasePool,
+    function: Callable[..., T],
+    chunks: Iterator,
+    timeout: float | None,
+    map_future: MapFuture[Any] | ProcessMapFuture[Any],
+    chunk_queue: "Queue[Future | BaseException | None]",
+    chunk_runner: Callable,
+):
+    """Schedules the map chunks lazily, applying backpressure on the budget."""
+    try:
+        for chunk in chunks:
+            if map_future.map_cancelled:
+                break
 
-    def done_map(_):
-        if not map_future.done():
-            map_future.set_result(MapResults(futures, timeout=timeout))
+            future: Future = pool._schedule_map_chunk(
+                chunk_runner, function, chunk, timeout
+            )
+            # each Pool schedules the Future subtype its MapFuture expects
+            map_future.register(future)  # type: ignore[arg-type]
+            chunk_queue.put(future)
+    except BaseException as error:  # budget rejection, pool shutdown...
+        chunk_queue.put(error)
+    finally:
+        chunk_queue.put(None)
 
-    for future in futures:
-        future.add_done_callback(done_map)
-        setattr(future, "map_future", map_future)
 
-    return map_future
+def drain_pending_tasks(context: PoolContext):
+    """Releases the budget of tasks stranded in the queue on shutdown.
+
+    Workers and scheduler loops do not consume further tasks once the Pool
+    is stopped or broken, so their slots are returned explicitly.
+    Idempotent with respect of the Future done callbacks.
+
+    """
+    task_queue: Queue[Task | None] = context.task_queue
+
+    while True:
+        try:
+            task = task_queue.get_nowait()
+        except Empty:
+            break
+
+        if task is None:  # termination sentinel, hand it back to the loop
+            task_queue.put(None)
+            break
+
+        task_queue.task_done()
+        context.budget.release_task(task)
 
 
 def iter_chunks(iterable: Iterable[Any], chunksize: int) -> Iterator:
@@ -307,6 +495,75 @@ class PoolStatus(IntEnum):
     ERROR = 4
 
 
+class TaskBudget:
+    """Pool-wide admission budget tracking unfinished tasks.
+
+    A single instance is shared by every task created within the Pool,
+    no matter whether it originates from *schedule*, *submit*, *map*
+    or the concurrent/asynchronous decorators.
+
+    A slot is acquired upon task admission and released exactly once
+    when the related task reaches its terminal state.
+
+    A *limit* of zero disables the budget, preserving the unbounded
+    historical behaviour.
+
+    """
+
+    def __init__(self, limit: int, block_on_full: bool):
+        if limit < 0:
+            raise ValueError("max_unfinished_tasks must be >= 0")
+
+        self.limit: int = limit
+        self.block_on_full: bool = block_on_full
+        self._semaphore: Semaphore | None = Semaphore(limit) if limit else None
+        self._release_lock: Lock = Lock()
+
+    @property
+    def limited(self) -> bool:
+        return self._semaphore is not None
+
+    def acquire(self, blocking: bool | None = None):
+        """Acquires an admission slot.
+
+        When *blocking* is None, the Pool configuration is used.
+        Raises *PoolFullError* if a non-blocking acquisition fails.
+
+        """
+        if self._semaphore is None:
+            return
+
+        if blocking is None:
+            blocking = self.block_on_full
+
+        if not self._semaphore.acquire(blocking=blocking):
+            raise PoolFullError(
+                "The Pool unfinished task budget is exhausted (%d)" % self.limit
+            )
+
+    def release(self):
+        """Releases a slot which was never bound to a Task."""
+        if self._semaphore is not None:
+            self._semaphore.release()
+
+    def release_task(self, task: Task):
+        """Releases the slot bound to a Task.
+
+        Idempotent: shutdown draining and Future callbacks can race
+        without ever returning more slots than were acquired.
+
+        """
+        if self._semaphore is None:
+            return
+
+        with self._release_lock:
+            if task.budget_released:
+                return
+            task.budget_released = True
+
+        self._semaphore.release()
+
+
 @dataclass
 class Worker:
     """Worker configuration."""
@@ -326,4 +583,4 @@ class TaskPayload(Generic[T]):
 
 
 PoolT = TypeVar("PoolT", bound=BasePool)
-MapFutureType = TypeVar("MapFutureType", bound=MapFuture | ProcessMapFuture)
+MapFutureT = TypeVar("MapFutureT", bound="MapFuture[Any] | ProcessMapFuture[Any]")

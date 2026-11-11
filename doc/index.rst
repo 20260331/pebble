@@ -83,7 +83,7 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
 ---------------
 
 .. _pebble.ProcessPool:
-.. class:: pebble.ProcessPool(max_workers=multiprocessing.cpu_count(), max_tasks=0, initializer=None, initargs=None, context=None)
+.. class:: pebble.ProcessPool(max_workers=multiprocessing.cpu_count(), max_tasks=0, initializer=None, initargs=None, context=None, max_unfinished_tasks=0, block=True)
 
    A Pool allows to schedule jobs into a Pool of Processes which will perform them concurrently.
    Process pools work as well as a *context manager*.
@@ -92,6 +92,8 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
    *initializer* must be callable, if passed, it will be called every time a worker is started, receiving *initargs* as arguments.
 
    The *context* parameter can be used to specify the multiprocessing.context_ object used for starting the worker processes.
+
+   *max_unfinished_tasks* enables an optional pool-wide admission budget limiting the amount of unfinished tasks (queued and running together) admitted by the Pool. A value of zero disables the budget. Tasks scheduled via *schedule*, *submit*, *map* and the *concurrent*/*asynchronous* decorators all share the same budget. When the budget is exhausted, *block* controls the behaviour: if True (the default) scheduling calls wait for a slot to become available; if False they raise *pebble.PoolFullError* immediately. Slots are returned as soon as a task terminates, including on cancellation, timeout, serialization failure, worker abnormal termination or pool shutdown. The *map* method consumes its input lazily, back-pressuring against the budget instead of prefetching the whole iterable.
 
    .. data:: active
 
@@ -139,13 +141,15 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
       The *join* function must be called only in the main loop. Calling it in a pebble.ProcessFuture_ callback will result in a deadlock.
 
 .. _pebble.ThreadPool:
-.. class:: pebble.ThreadPool(max_workers=multiprocessing.cpu_count(), max_tasks=0, initializer=None, initargs=None)
+.. class:: pebble.ThreadPool(max_workers=multiprocessing.cpu_count(), max_tasks=0, initializer=None, initargs=None, max_unfinished_tasks=0, block=True)
 
    A ThreadPool allows to schedule jobs into a Pool of Threads which will perform them concurrently.
    Thread pools work as well as a *context manager*.
 
    *max_workers* is an integer representing the amount of desired process workers managed by the pool. If *max_tasks* is a number greater than zero, each worker will be restarted after performing an equal amount of tasks.
    *initializer* must be callable, if passed, it will be called every time a worker is started, receiving *initargs* as arguments.
+
+   *max_unfinished_tasks* enables an optional pool-wide admission budget limiting the amount of unfinished tasks (queued and running together) admitted by the Pool. A value of zero disables the budget. Tasks scheduled via *schedule*, *submit*, *map* and the *concurrent*/*asynchronous* decorators all share the same budget. When the budget is exhausted, *block* controls the behaviour: if True (the default) scheduling calls wait for a slot to become available; if False they raise *pebble.PoolFullError* immediately. Slots are returned as soon as a task terminates, including on cancellation or pool shutdown. The *map* method consumes its input lazily, back-pressuring against the budget instead of prefetching the whole iterable.
 
    .. data:: active
 
@@ -272,6 +276,10 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
    .. data:: pid
 
       Integer representing the process identifier or `None`.
+
+.. exception:: pebble.PoolFullError
+
+   Raised by *schedule*, *submit* or *map* when the pool-wide unfinished task budget configured via *max_unfinished_tasks* is exhausted and the Pool was created with *block=False*. Pools created with *block=True* wait for a free slot instead.
 
 
 Programming Guidelines
