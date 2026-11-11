@@ -24,7 +24,7 @@ import signal
 import pickle
 import multiprocessing
 
-from queue import Queue
+from queue import Queue, Empty
 from itertools import count
 from threading import Thread
 from dataclasses import dataclass
@@ -38,6 +38,7 @@ from pebble.pool.base_pool import Worker, iter_chunks, run_initializer
 from pebble.pool.base_pool import PoolContext, BasePool, Task, TaskPayload
 from pebble.pool.base_pool import MapResults
 from pebble.pool.base_pool import PoolStatus, ProcessMapFuture, map_results
+from pebble.pool.scheduler import ChannelConfig
 from pebble.common import Result, ResultStatus, CONSTS
 from pebble.common import ProcessExpired, ProcessFuture
 from pebble.common.types import MultiprocessingContext, P, T
@@ -68,8 +69,9 @@ class ProcessPool(BasePool):
         initializer: Callable | None = None,
         initargs: Iterable[Any] = (),
         context: MultiprocessingContext = multiprocessing,
+        channels: Mapping[str, ChannelConfig] | None = None,
     ):
-        super().__init__(max_workers, max_tasks, initializer, initargs)
+        super().__init__(max_workers, max_tasks, initializer, initargs, channels)
         self._pool_manager: PoolManager = PoolManager(self._context, context)
         self._task_scheduler_loop: Thread | None = None
         self._pool_manager_loop: Thread | None = None
@@ -112,6 +114,7 @@ class ProcessPool(BasePool):
         args: Iterable[Any] = (),
         kwargs: Mapping[str, Any] = {},
         timeout: float | None = None,
+        channel: str | None = None,
     ) -> ProcessFuture[T]:
         """Schedules *function* to be run the Pool.
 
@@ -121,14 +124,18 @@ class ProcessPool(BasePool):
         *timeout* is an integer, if expires the task will be terminated
         and *Future.result()* will raise *TimeoutError*.
 
+        *channel* optionally routes the task to a named workload channel
+        configured at Pool construction.
+
         A *pebble.ProcessFuture* object is returned.
 
         """
         self._check_pool_status()
+        self._context.scheduler.validate(channel)
 
         future: ProcessFuture = ProcessFuture()
         payload: TaskPayload = TaskPayload(function, args, kwargs)
-        task: Task = Task(next(self._task_counter), future, timeout, payload)
+        task: Task = Task(next(self._task_counter), future, timeout, payload, channel)
 
         self._context.task_queue.put(task)
 
@@ -155,7 +162,8 @@ class ProcessPool(BasePool):
         function: Callable[..., T],
         *iterables: Iterable[Any],
         timeout: float | None = None,
-        chunksize: int = 1
+        chunksize: int = 1,
+        channel: str | None = None,
     ) -> ProcessMapFuture[MapResults[T]]:
         """Computes the *function* using arguments from
         each of the iterables. Stops when the shortest iterable is exhausted.
@@ -167,6 +175,9 @@ class ProcessPool(BasePool):
         *chunksize* controls the size of the chunks the iterable will
         be broken into before being passed to the function.
 
+        *channel* optionally routes all the chunks to a named workload
+        channel configured at Pool construction.
+
         A *pebble.ProcessFuture* object is returned.
 
         """
@@ -176,7 +187,12 @@ class ProcessPool(BasePool):
             raise ValueError("chunksize must be >= 1")
 
         futures: List[ProcessFuture] = [
-            self.schedule(process_chunk, args=(function, chunk), timeout=timeout)
+            self.schedule(
+                process_chunk,
+                args=(function, chunk),
+                timeout=timeout,
+                channel=channel,
+            )
             for chunk in iter_chunks(zip(*iterables), chunksize)
         ]
         future: ProcessMapFuture = ProcessMapFuture(futures)
@@ -185,20 +201,41 @@ class ProcessPool(BasePool):
 
 
 def task_scheduler_loop(pool_manager: PoolManager):
-    task_queue: Queue = pool_manager.context.task_queue
+    context: PoolContext = pool_manager.context
+    task_queue: Queue = context.task_queue
+    scheduler = context.scheduler
 
     try:
-        while pool_manager.context.alive and not GLOBAL_SHUTDOWN:
-            task: Task | None = pool_manager.context.task_queue.get()
+        while context.alive and not GLOBAL_SHUTDOWN:
+            while True:
+                try:
+                    task: Task | None = task_queue.get_nowait()
+                except Empty:
+                    break
 
-            if task is not None:
-                if task.future.cancelled():
+                if task is None:  # Termination sentinel received
+                    task_queue.task_done()
+
+                    return
+                elif task.future.cancelled():
                     task.set_running_or_notify_cancel()
                     task_queue.task_done()
                 else:
+                    scheduler.admit(task)
+
+            while context.alive and not GLOBAL_SHUTDOWN:
+                task = scheduler.retrieve()
+
+                if task is None:
+                    break
+                elif task.future.cancelled():
+                    task.set_running_or_notify_cancel()
+                    scheduler.release(task)
+                    task_queue.task_done()
+                else:
                     pool_manager.schedule(task)
-            else:
-                task_queue.task_done()  # Termination sentinel received
+
+            scheduler.wait(CONSTS.sleep_unit)
     except BrokenProcessPool as error:
         pool_manager.handle_broken_pool(error)
 
@@ -225,7 +262,7 @@ class PoolManager:
 
     def __init__(self, context: PoolContext, mp_context: MultiprocessingContext):
         self.context: PoolContext = context
-        self.task_manager: TaskManager = TaskManager(context.task_queue.task_done)
+        self.task_manager: TaskManager = TaskManager(context)
         self.worker_manager: WorkerManager = WorkerManager(
             context.workers, context.worker_parameters, mp_context
         )
@@ -336,9 +373,10 @@ class TaskManager:
     Timing out and cancelled tasks are handled as well.
     """
 
-    def __init__(self, task_done_callback: Callable):
+    def __init__(self, context: PoolContext):
+        self.context: PoolContext = context
         self.tasks: Dict[int, Task] = {}
-        self.task_done_callback: Callable = task_done_callback
+        self.task_done_callback: Callable = context.task_queue.task_done
 
     def register(self, task: Task):
         self.tasks[task.id] = task
@@ -367,6 +405,7 @@ class TaskManager:
             else:
                 task.future.set_exception(result.value)
 
+            self.context.scheduler.release(task)
             self.task_done_callback()
 
     def task_problem(self, task_id: int, error: BaseException):
@@ -425,7 +464,9 @@ class WorkerManager:
 
     def dispatch(self, task: Task):
         try:
-            self.pool_channel.send(WorkerTask(task.id, task.payload))  # type: ignore[union-attr]
+            self.pool_channel.send(  # type: ignore[union-attr]
+                WorkerTask(task.id, task.channel, task.payload)
+            )
         except PICKLING_ERRORS as error:
             raise error
         except OSError as error:
@@ -638,6 +679,7 @@ class WorkerTask:
     """A Task assigned to a worker."""
 
     id: int
+    channel: str | None
     payload: TaskPayload
 
 

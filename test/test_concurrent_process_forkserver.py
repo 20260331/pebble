@@ -9,6 +9,7 @@ import multiprocessing
 from concurrent.futures import CancelledError, TimeoutError
 
 from pebble import concurrent, ProcessExpired, ProcessPool
+from pebble.pool.scheduler import ChannelConfig
 
 
 # set start method
@@ -299,3 +300,21 @@ class TestProcessConcurrent(unittest.TestCase):
         future1 = pool_decorated(1, 1)
         future2 = pool_decorated(1, 1)
         self.assertEqual(future1.result(), future2.result())
+
+    def test_pool_channel_decorated(self):
+        """Pool decorated function honors the channel parameter."""
+        with ProcessPool(
+            max_workers=2,
+            context=mp_context,
+            channels={"a": ChannelConfig(max_concurrency=1)},
+        ) as pool:
+            channel_decorated = concurrent.process(
+                not_decorated, pool=pool, channel="a"
+            )
+
+            self.assertEqual(channel_decorated(1, 1).result(), 2)
+
+            with self.assertRaises(ValueError):
+                concurrent.process(
+                    not_decorated, pool=pool, channel="b"
+                )(1)

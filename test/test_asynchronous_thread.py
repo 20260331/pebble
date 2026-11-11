@@ -5,6 +5,7 @@ import dataclasses
 
 from pebble import ThreadPool
 from pebble import asynchronous
+from pebble.pool.scheduler import ChannelConfig
 
 
 def not_decorated(argument, keyword_argument=0):
@@ -231,3 +232,18 @@ class TestThreadAsynchronous(unittest.TestCase):
             return await pool_decorated(1)
 
         self.assertEqual(asyncio.run(test()), asyncio.run(test()))
+
+    def test_pool_channel_decorated(self):
+        """Thread pool asynchronous decorator honors the channel parameter."""
+        async def scenario():
+            with ThreadPool(
+                max_workers=2,
+                channels={"a": ChannelConfig(max_concurrency=1)},
+            ) as pool:
+                channel_decorated = asynchronous.thread(
+                    not_decorated, pool=pool, channel="a"
+                )
+
+                return await channel_decorated(1, 1)
+
+        self.assertEqual(asyncio.run(scenario()), 2)

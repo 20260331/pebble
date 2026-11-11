@@ -28,7 +28,10 @@ from pebble.pool.thread import ThreadPool
 def thread(func: Callable[P, T]) -> Callable[P, asyncio.Future[T]]: ...
 @overload
 def thread(
-    name: str | None = None, daemon: bool = True, pool: ThreadPool | None = None
+    name: str | None = None,
+    daemon: bool = True,
+    pool: ThreadPool | None = None,
+    channel: str | None = None,
 ) -> Callable[[Callable[P, T]], Callable[P, asyncio.Future[T]]]: ...
 def thread(*args, **kwargs):
     """Runs the decorated function within a concurrent thread,
@@ -45,6 +48,9 @@ def thread(*args, **kwargs):
     The pool parameter accepts a pebble.ThreadPool instance to be used
     instead of running the function in a new process.
 
+    The channel parameter routes the task to a named workload channel
+    of the provided pool, it is ignored if pool is not set.
+
     """
     return common.decorate_function(_thread_wrapper, *args, **kwargs)
 
@@ -56,6 +62,7 @@ def _thread_wrapper(
     _timeout: float,
     _unused_mp_context: None,
     pool: ThreadPool | None,
+    channel: str | None,
 ) -> Callable:
     if pool is not None:
         if not isinstance(pool, ThreadPool):
@@ -66,11 +73,19 @@ def _thread_wrapper(
         loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
 
         if pool is not None:
-            future = loop.run_in_executor(
-                pool,  # type: ignore[arg-type] - Executor compatible API
-                function,
-                *args,  # type: ignore[arg-type] - Unknown error
-            )
+            if channel is not None:
+                # run_in_executor cannot carry the channel, schedule
+                # directly and bridge the resulting Future to asyncio.
+                pebble_future = pool.schedule(
+                    function, args=args, kwargs=kwargs, channel=channel
+                )
+                future = asyncio.wrap_future(pebble_future)
+            else:
+                future = loop.run_in_executor(
+                    pool,  # type: ignore[arg-type] - Executor compatible API
+                    function,
+                    *args,  # type: ignore[arg-type] - Unknown error
+                )
         else:
             future = loop.create_future()
 

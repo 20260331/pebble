@@ -3,6 +3,7 @@ import threading
 
 from pebble import concurrent
 from pebble import ThreadPool
+from pebble.pool.scheduler import ChannelConfig
 
 
 def not_decorated(argument, keyword_argument=0):
@@ -175,3 +176,20 @@ class TestThreadConcurrent(unittest.TestCase):
         future1 = pool_decorated(1, 1)
         future2 = pool_decorated(1, 1)
         self.assertEqual(future1.result(), future2.result())
+
+    def test_pool_channel_decorated(self):
+        """Thread pool decorated function honors the channel parameter."""
+        with ThreadPool(
+            max_workers=2,
+            channels={"a": ChannelConfig(max_concurrency=1)},
+        ) as pool:
+            channel_decorated = concurrent.thread(
+                not_decorated, pool=pool, channel="a"
+            )
+
+            self.assertEqual(channel_decorated(1, 1).result(), 2)
+
+            with self.assertRaises(ValueError):
+                concurrent.thread(
+                    not_decorated, pool=pool, channel="b"
+                )(1)

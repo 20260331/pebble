@@ -1,0 +1,2634 @@
+diff --git a/doc/index.rst b/doc/index.rst
+index 696ae4d..397ec14 100644
+--- a/doc/index.rst
++++ b/doc/index.rst
+@@ -19,7 +19,7 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
+ `Concurrent Module`
+ -------------------
+ 
+-.. decorator:: concurrent.process(timeout=None, name=None, daemon=True, context=None, pool=None)
++.. decorator:: concurrent.process(timeout=None, name=None, daemon=True, context=None, pool=None, channel=None)
+ 
+    Runs the decorated function in a concurrent process, taking care of the results and error management.
+ 
+@@ -35,7 +35,9 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
+ 
+    The *pool* parameter accepts a pebble.ProcessPool_ object. If provided, the pool will be used to run the function instead of a dedicated process. The *name*, *daemon* and *context* parameters will be ignored.
+ 
+-.. decorator:: concurrent.thread(name=None, daemon=True, pool=None)
++   The *channel* parameter routes the decorated function to a named workload channel of the provided *pool*. It is ignored if *pool* is not set.
++
++.. decorator:: concurrent.thread(name=None, daemon=True, pool=None, channel=None)
+ 
+    Runs the decorated function in a concurrent thread, taking care of the results and error management.
+ 
+@@ -47,10 +49,12 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
+ 
+    The *pool* parameter accepts a pebble.ThreadPool_ object. If provided, the pool will be used to run the function instead of a dedicated thread. The *name* and *daemon* parameters will be ignored.
+ 
++   The *channel* parameter routes the decorated function to a named workload channel of the provided *pool*. It is ignored if *pool* is not set.
++
+ `Asynchronous Module`
+ ---------------------
+ 
+-.. decorator:: asynchronous.process(timeout=None, name=None, daemon=True, context=None, pool=None)
++.. decorator:: asynchronous.process(timeout=None, name=None, daemon=True, context=None, pool=None, channel=None)
+ 
+    Runs the decorated function in a concurrent process, taking care of the results and error management.
+ 
+@@ -66,7 +70,9 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
+ 
+    The *pool* parameter accepts a pebble.ProcessPool_ object. If provided, the pool will be used to run the function instead of a dedicated process. The *name*, *daemon* and *context* parameters will be ignored.
+ 
+-.. decorator:: asynchronous.thread(name=None, daemon=True, pool=None)
++   The *channel* parameter routes the decorated function to a named workload channel of the provided *pool*. It is ignored if *pool* is not set.
++
++.. decorator:: asynchronous.thread(name=None, daemon=True, pool=None, channel=None)
+ 
+    Runs the decorated function in a concurrent thread, taking care of the results and error management.
+ 
+@@ -78,12 +84,23 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
+ 
+    The *pool* parameter accepts a pebble.ThreadPool_ object. If provided, the pool will be used to run the function instead of a dedicated thread. The *name* and *daemon* parameters will be ignored.
+ 
++   The *channel* parameter routes the decorated function to a named workload channel of the provided *pool*. It is ignored if *pool* is not set.
++
+ 
+ `Pebble Module`
+ ---------------
+ 
++.. _pebble.ChannelConfig:
++.. class:: pebble.ChannelConfig(max_concurrency=None, weight=1)
++
++   Defines the configuration of a named workload channel.
++
++   *max_concurrency* is an integer limiting the amount of tasks belonging to the channel which are allowed to be dispatched but not yet completed at any given time. If None, the channel is only bounded by the Pool *max_workers*.
++
++   *weight* is a positive integer controlling the share of workers assigned to the channel once multiple channels have tasks ready to run. A channel with weight 3 is served three times as often as a channel with weight 1 within each scheduling round.
++
+ .. _pebble.ProcessPool:
+-.. class:: pebble.ProcessPool(max_workers=multiprocessing.cpu_count(), max_tasks=0, initializer=None, initargs=None, context=None)
++.. class:: pebble.ProcessPool(max_workers=multiprocessing.cpu_count(), max_tasks=0, initializer=None, initargs=None, context=None, channels=None)
+ 
+    A Pool allows to schedule jobs into a Pool of Processes which will perform them concurrently.
+    Process pools work as well as a *context manager*.
+@@ -93,11 +110,13 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
+ 
+    The *context* parameter can be used to specify the multiprocessing.context_ object used for starting the worker processes.
+ 
++   The optional *channels* parameter accepts a mapping of channel names to pebble.ChannelConfig_ objects configuring the named workload channels handled by the Pool. See the `Workload channels`_ section.
++
+    .. data:: active
+ 
+       True if the Pool is running, false otherwise.
+ 
+-   .. function:: schedule(function, args=(), kwargs={}, timeout=None)
++   .. function:: schedule(function, args=(), kwargs={}, timeout=None, channel=None)
+ 
+       Schedule the function to be executed within the Pool.
+ 
+@@ -109,7 +128,7 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
+ 
+       *timeout* can be None, an integer or a float. Once expired, it will force the timed out task to be interrupted and the worker will be restarted. *Future.result()* will raise *TimeoutError*, callbacks will be executed.
+ 
+-   .. function:: map(function, *iterables, chunksize=1, timeout=None)
++   .. function:: map(function, *iterables, chunksize=1, timeout=None, channel=None)
+ 
+       Concurrently compute the *function* using arguments from each of the iterables.
+       Stop when the shortest iterable is exhausted.
+@@ -119,6 +138,8 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
+       *timeout* is an integer or a float. If given, it will be assigned to each chunk of the iterables.
+       If the computation of the given chunk will last longer than *timeout*, its execution will be terminated. Iterating over its result will raise *TimeoutError*, all computations over the chunk will be lost.
+ 
++      If *channel* is given, all the chunks are routed to the matching named workload channel.
++
+       A pebble.ProcessMapFuture_ object is returned. Its *result* method will return an iterable containing the results of the computation in the same order as they were given.
+ 
+    .. function:: close()
+@@ -139,7 +160,7 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
+       The *join* function must be called only in the main loop. Calling it in a pebble.ProcessFuture_ callback will result in a deadlock.
+ 
+ .. _pebble.ThreadPool:
+-.. class:: pebble.ThreadPool(max_workers=multiprocessing.cpu_count(), max_tasks=0, initializer=None, initargs=None)
++.. class:: pebble.ThreadPool(max_workers=multiprocessing.cpu_count(), max_tasks=0, initializer=None, initargs=None, channels=None)
+ 
+    A ThreadPool allows to schedule jobs into a Pool of Threads which will perform them concurrently.
+    Thread pools work as well as a *context manager*.
+@@ -147,11 +168,13 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
+    *max_workers* is an integer representing the amount of desired process workers managed by the pool. If *max_tasks* is a number greater than zero, each worker will be restarted after performing an equal amount of tasks.
+    *initializer* must be callable, if passed, it will be called every time a worker is started, receiving *initargs* as arguments.
+ 
++   The optional *channels* parameter accepts a mapping of channel names to pebble.ChannelConfig_ objects configuring the named workload channels handled by the Pool. See the `Workload channels`_ section.
++
+    .. data:: active
+ 
+       True if the Pool is running, false otherwise.
+ 
+-   .. function:: schedule(function, args=(), kwargs={})
++   .. function:: schedule(function, args=(), kwargs={}, channel=None)
+ 
+       Schedule the function to be executed within the Pool.
+ 
+@@ -161,7 +184,9 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
+ 
+       *args* and *kwargs* will be passed to the function respectively as its arguments and keyword arguments.
+ 
+-   .. function:: map(function, *iterables, chunksize=1)
++      *channel* optionally routes the task to a named workload channel configured at Pool construction.
++
++   .. function:: map(function, *iterables, chunksize=1, channel=None)
+ 
+       Concurrently compute the *function* using arguments from each of the iterables.
+       Stop when the shortest iterable is exhausted.
+@@ -171,6 +196,8 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
+       *timeout* is an integer or a float. If given, it will be assigned to every chunk of the iterables.
+       If the computation of the given chunk will last longer than *timeout*, iterating over its result will raise *TimeoutError*.
+ 
++      If *channel* is given, all the chunks are routed to the matching named workload channel.
++
+       A pebble.MapFuture_ object is returned. Its *result* method will return an iterable containing the results of the computation in the same order as they were given.
+ 
+    .. function:: close()
+@@ -509,6 +536,36 @@ The `concurrent` and `asynchronous` decorators accept a *pool* parameter. This i
+     wait(futures)
+ 
+ 
++Workload channels
+++++++++++++++++++
++
++Pools accept optional, named workload channels through the *channels* parameter, a mapping of channel names to pebble.ChannelConfig_ objects. Each channel defines a *max_concurrency* limit and a *weight*.
++
++Tasks are routed to a channel via the *channel* parameter of *schedule*, *map* or of the *concurrent*/*asynchronous* decorators. Tasks without a channel are routed to a default channel which is only bounded by the Pool amount of workers. Scheduling a task on an undeclared channel raises a *ValueError*.
++
++The scheduler dispatches the ready tasks with a weighted round robin discipline. A channel continuously submitting tasks cannot therefore starve the other ready channels, while the per-channel concurrency limit is always honored. The channel assignment is a property of the task and is preserved across cancellation, *map* chunking, decorators and worker restarts.
++
++::
++
++    from pebble import ProcessPool, ChannelConfig
++
++    def process_data(identifier):
++        return identifier
++
++    with ProcessPool(
++        max_workers=4,
++        channels={
++            # at most one ingestion task at a time, low scheduling weight
++            "ingestion": ChannelConfig(max_concurrency=1, weight=1),
++            # up to two analysis tasks, served three times more often
++            "analysis": ChannelConfig(max_concurrency=2, weight=3),
++        },
++    ) as pool:
++        ingestion = pool.schedule(process_data, args=[1], channel="ingestion")
++        analysis = pool.map(
++            process_data, range(100), channel="analysis"
++        )
++
+ Pools and AsyncIO
+ +++++++++++++++++
+ 
+diff --git a/pebble/__init__.py b/pebble/__init__.py
+index e899a4a..012e5c0 100644
+--- a/pebble/__init__.py
++++ b/pebble/__init__.py
+@@ -16,6 +16,7 @@ __all__ = [
+     "ProcessExpired",
+     "ProcessPool",
+     "ThreadPool",
++    "ChannelConfig",
+     "CONSTS",
+ ]
+ 
+@@ -25,3 +26,4 @@ from pebble.decorators import synchronized, sighandler
+ from pebble.functions import waitforqueues, waitforthreads
+ from pebble.common import ProcessExpired, ProcessFuture, CONSTS
+ from pebble.pool import ThreadPool, ProcessPool, MapFuture, ProcessMapFuture
++from pebble.pool import ChannelConfig
+diff --git a/pebble/asynchronous/process.py b/pebble/asynchronous/process.py
+index bfc31fb..81f206d 100644
+--- a/pebble/asynchronous/process.py
++++ b/pebble/asynchronous/process.py
+@@ -41,6 +41,7 @@ def process(
+     timeout: float | None = None,
+     mp_context: MultiprocessingContext | None = None,
+     pool: ProcessPool | None = None,
++    channel: str | None = None,
+ ) -> Callable[[Callable[P, T]], Callable[P, asyncio.Future[T]]]: ...
+ def process(*args, **kwargs):
+     """Runs the decorated function in a concurrent process,
+@@ -64,6 +65,9 @@ def process(*args, **kwargs):
+     The pool parameter accepts a pebble.ProcessPool instance to be used
+     instead of running the function in a new process.
+ 
++    The channel parameter routes the task to a named workload channel
++    of the provided pool, it is ignored if pool is not set.
++
+     """
+     return common.decorate_function(_process_wrapper, *args, **kwargs)
+ 
+@@ -75,6 +79,7 @@ def _process_wrapper(
+     timeout: float,
+     mp_context: MultiprocessingContext,
+     pool: ProcessPool | None,
++    channel: str | None,
+ ) -> Callable:
+     if isinstance(function, FunctionType):
+         common.register_function(function)
+@@ -95,12 +100,24 @@ def _process_wrapper(
+         target, args = common.maybe_install_trampoline(function, args, start_method)
+ 
+         if pool is not None:
+-            future = loop.run_in_executor(
+-                pool,  # type: ignore[arg-type] - Executor compatible API
+-                target,
+-                timeout,
+-                *args,
+-            )
++            if channel is not None:
++                # run_in_executor cannot carry the channel, schedule
++                # directly and bridge the resulting Future to asyncio.
++                pebble_future = pool.schedule(
++                    target,
++                    args=args,
++                    kwargs=kwargs,
++                    timeout=timeout,
++                    channel=channel,
++                )
++                future = asyncio.wrap_future(pebble_future)
++            else:
++                future = loop.run_in_executor(
++                    pool,  # type: ignore[arg-type] - Executor compatible API
++                    target,
++                    timeout,
++                    *args,
++                )
+         else:
+             future: asyncio.Future = loop.create_future()
+             reader, writer = mp_context.Pipe(duplex=False)
+diff --git a/pebble/asynchronous/thread.py b/pebble/asynchronous/thread.py
+index 47d361c..e217e49 100644
+--- a/pebble/asynchronous/thread.py
++++ b/pebble/asynchronous/thread.py
+@@ -28,7 +28,10 @@ from pebble.pool.thread import ThreadPool
+ def thread(func: Callable[P, T]) -> Callable[P, asyncio.Future[T]]: ...
+ @overload
+ def thread(
+-    name: str | None = None, daemon: bool = True, pool: ThreadPool | None = None
++    name: str | None = None,
++    daemon: bool = True,
++    pool: ThreadPool | None = None,
++    channel: str | None = None,
+ ) -> Callable[[Callable[P, T]], Callable[P, asyncio.Future[T]]]: ...
+ def thread(*args, **kwargs):
+     """Runs the decorated function within a concurrent thread,
+@@ -45,6 +48,9 @@ def thread(*args, **kwargs):
+     The pool parameter accepts a pebble.ThreadPool instance to be used
+     instead of running the function in a new process.
+ 
++    The channel parameter routes the task to a named workload channel
++    of the provided pool, it is ignored if pool is not set.
++
+     """
+     return common.decorate_function(_thread_wrapper, *args, **kwargs)
+ 
+@@ -56,6 +62,7 @@ def _thread_wrapper(
+     _timeout: float,
+     _unused_mp_context: None,
+     pool: ThreadPool | None,
++    channel: str | None,
+ ) -> Callable:
+     if pool is not None:
+         if not isinstance(pool, ThreadPool):
+@@ -66,11 +73,19 @@ def _thread_wrapper(
+         loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+ 
+         if pool is not None:
+-            future = loop.run_in_executor(
+-                pool,  # type: ignore[arg-type] - Executor compatible API
+-                function,
+-                *args,  # type: ignore[arg-type] - Unknown error
+-            )
++            if channel is not None:
++                # run_in_executor cannot carry the channel, schedule
++                # directly and bridge the resulting Future to asyncio.
++                pebble_future = pool.schedule(
++                    function, args=args, kwargs=kwargs, channel=channel
++                )
++                future = asyncio.wrap_future(pebble_future)
++            else:
++                future = loop.run_in_executor(
++                    pool,  # type: ignore[arg-type] - Executor compatible API
++                    function,
++                    *args,  # type: ignore[arg-type] - Unknown error
++                )
+         else:
+             future = loop.create_future()
+ 
+diff --git a/pebble/common/shared.py b/pebble/common/shared.py
+index db4658a..3681a09 100644
+--- a/pebble/common/shared.py
++++ b/pebble/common/shared.py
+@@ -63,30 +63,38 @@ def decorate_function(wrapper: Callable, *args, **kwargs) -> Callable:
+     daemon = kwargs.get("daemon", True)
+     timeout = kwargs.get("timeout")
+     mp_context = kwargs.get("context")
++    channel = kwargs.get("channel")
+ 
+     # decorator without parameters: @process/process(function)
+     if not kwargs and len(args) == 1 and callable(args[0]):
+-        return wrapper(args[0], name, daemon, timeout, multiprocessing, pool)
++        return wrapper(args[0], name, daemon, timeout, multiprocessing, pool, channel)
+ 
+     # decorator with parameters
+-    _validate_parameters(name, daemon, timeout)
++    _validate_parameters(name, daemon, timeout, channel)
+     mp_context = mp_context if mp_context is not None else multiprocessing
+ 
+     ## without @pie syntax: process(function, timeout=12)
+     if len(args) == 1 and callable(args[0]):
+-        return wrapper(args[0], name, daemon, timeout, multiprocessing, pool)
++        return wrapper(args[0], name, daemon, timeout, multiprocessing, pool, channel)
+ 
+     ## with @pie syntax: @process(timeout=12)
+     def decorating_function(function: Callable) -> Callable:
+-        return wrapper(function, name, daemon, timeout, mp_context, pool)
++        return wrapper(function, name, daemon, timeout, mp_context, pool, channel)
+ 
+     return decorating_function
+ 
+ 
+-def _validate_parameters(name: str | None, daemon: bool, timeout: float | None):
++def _validate_parameters(
++    name: str | None,
++    daemon: bool,
++    timeout: float | None,
++    channel: str | None,
++):
+     if name is not None and not isinstance(name, str):
+         raise TypeError("Name expected to be None or string")
+     if daemon is not None and not isinstance(daemon, bool):
+         raise TypeError("Daemon expected to be None or bool")
+     if timeout is not None and not isinstance(timeout, (int, float)):
+         raise TypeError("Timeout expected to be None or integer or float")
++    if channel is not None and not isinstance(channel, str):
++        raise TypeError("Channel expected to be None or string")
+diff --git a/pebble/concurrent/process.py b/pebble/concurrent/process.py
+index 249ca87..55dc95b 100644
+--- a/pebble/concurrent/process.py
++++ b/pebble/concurrent/process.py
+@@ -40,6 +40,7 @@ def process(
+     timeout: float | None = None,
+     mp_context: MultiprocessingContext | None = None,
+     pool: ProcessPool | None = None,
++    channel: str | None = None,
+ ) -> Callable[[Callable[P, T]], Callable[P, common.ProcessFuture[T]]]: ...
+ def process(*args, **kwargs):
+     """Runs the decorated function in a concurrent process,
+@@ -63,6 +64,9 @@ def process(*args, **kwargs):
+     The pool parameter accepts a pebble.ProcessPool instance to be used
+     instead of running the function in a new process.
+ 
++    The channel parameter routes the task to a named workload channel
++    of the provided pool, it is ignored if pool is not set.
++
+     """
+     return common.decorate_function(_process_wrapper, *args, **kwargs)
+ 
+@@ -74,6 +78,7 @@ def _process_wrapper(
+     timeout: float,
+     mp_context: MultiprocessingContext,
+     pool: ProcessPool | None,
++    channel: str | None,
+ ) -> Callable:
+     if isinstance(function, FunctionType):
+         common.register_function(function)
+@@ -94,7 +99,11 @@ def _process_wrapper(
+ 
+         if pool is not None:
+             future: common.ProcessFuture = pool.schedule(
+-                target, args=args, kwargs=kwargs, timeout=timeout
++                target,
++                args=args,
++                kwargs=kwargs,
++                timeout=timeout,
++                channel=channel,
+             )
+         else:
+             future: common.ProcessFuture = common.ProcessFuture()
+diff --git a/pebble/concurrent/thread.py b/pebble/concurrent/thread.py
+index 62dd2b4..7819b06 100644
+--- a/pebble/concurrent/thread.py
++++ b/pebble/concurrent/thread.py
+@@ -29,7 +29,10 @@ from pebble.pool.thread import ThreadPool
+ def thread(func: Callable[P, T]) -> Callable[P, Future[T]]: ...
+ @overload
+ def thread(
+-    name: str | None = None, daemon: bool = True, pool: ThreadPool | None = None
++    name: str | None = None,
++    daemon: bool = True,
++    pool: ThreadPool | None = None,
++    channel: str | None = None,
+ ) -> Callable[[Callable[P, T]], Callable[P, Future[T]]]: ...
+ def thread(*args, **kwargs):
+     """Runs the decorated function within a concurrent thread,
+@@ -46,6 +49,9 @@ def thread(*args, **kwargs):
+     The pool parameter accepts a pebble.ThreadPool instance to be used
+     instead of running the function in a new process.
+ 
++    The channel parameter routes the task to a named workload channel
++    of the provided pool, it is ignored if pool is not set.
++
+     """
+     return common.decorate_function(_thread_wrapper, *args, **kwargs)
+ 
+@@ -57,6 +63,7 @@ def _thread_wrapper(
+     _timeout: float,
+     _mp_context,
+     pool: ThreadPool,
++    channel: str | None,
+ ) -> Callable:
+     if pool is not None:
+         if not isinstance(pool, ThreadPool):
+@@ -65,7 +72,9 @@ def _thread_wrapper(
+     @wraps(function)
+     def wrapper(*args: P.args, **kwargs: P.kwargs) -> Future[T]:
+         if pool is not None:
+-            future: Future = pool.schedule(function, args=args, kwargs=kwargs)
++            future: Future = pool.schedule(
++                function, args=args, kwargs=kwargs, channel=channel
++            )
+         else:
+             future = Future()
+ 
+diff --git a/pebble/pool/__init__.py b/pebble/pool/__init__.py
+index 46188fe..0d23607 100644
+--- a/pebble/pool/__init__.py
++++ b/pebble/pool/__init__.py
+@@ -1,6 +1,13 @@
+-__all__ = ["ThreadPool", "ProcessPool", "MapFuture", "ProcessMapFuture"]
++__all__ = [
++    "ThreadPool",
++    "ProcessPool",
++    "MapFuture",
++    "ProcessMapFuture",
++    "ChannelConfig",
++]
+ 
+ 
+ from pebble.pool.thread import ThreadPool
+ from pebble.pool.process import ProcessPool
+ from pebble.pool.base_pool import MapFuture, ProcessMapFuture
++from pebble.pool.scheduler import ChannelConfig
+diff --git a/pebble/pool/base_pool.py b/pebble/pool/base_pool.py
+index 839a562..22c2979 100644
+--- a/pebble/pool/base_pool.py
++++ b/pebble/pool/base_pool.py
+@@ -30,6 +30,7 @@ from typing import Any, Callable, Generic, Iterable
+ 
+ from pebble.common.types import T
+ from pebble.common import Result, ResultStatus, ProcessFuture, CONSTS
++from pebble.pool.scheduler import ChannelConfig, FairScheduler
+ 
+ 
+ class BasePool:
+@@ -39,9 +40,10 @@ class BasePool:
+         max_tasks: int,
+         initializer: Callable | None,
+         initargs: Iterable[Any],
++        channels: Mapping[str, ChannelConfig] | None = None,
+     ):
+         self._context: PoolContext = PoolContext(
+-            max_workers, max_tasks, initializer, initargs
++            max_workers, max_tasks, initializer, initargs, channels
+         )
+         self._loops: Iterable[Any] = ()
+         self._task_counter: itertools.count = itertools.count()
+@@ -127,14 +129,17 @@ class PoolContext:
+         max_tasks: int,
+         initializer: Callable | None,
+         initargs: Iterable[Any],
++        channels: Mapping[str, ChannelConfig] | None = None,
+     ):
+         self._status: PoolStatus = PoolStatus.CREATED
+         self.status_mutex: RLock = RLock()
+ 
+         self.task_queue: Queue[Task | None] = Queue()
++        self.dispatch_queue: Queue[Task | None] = Queue()
+         self.workers: int = max_workers
+         self.task_counter: itertools.count = itertools.count()
+         self.worker_parameters: Worker = Worker(max_tasks, initializer, initargs)
++        self.scheduler: FairScheduler = FairScheduler(channels)
+ 
+     @property
+     def status(self) -> PoolStatus:
+@@ -158,11 +163,13 @@ class Task:
+         future: Future,
+         timeout: float | None,
+         payload: TaskPayload,
++        channel: str | None = None,
+     ):
+         self.id: int = identifier
+         self.future: Future = future
+         self.timeout: float | None = timeout
+         self.payload: TaskPayload = payload
++        self.channel: str | None = channel
+         self.timestamp: float = 0.0
+         self.worker_id: int = 0
+ 
+diff --git a/pebble/pool/process.py b/pebble/pool/process.py
+index 034010d..2349999 100644
+--- a/pebble/pool/process.py
++++ b/pebble/pool/process.py
+@@ -24,7 +24,7 @@ import signal
+ import pickle
+ import multiprocessing
+ 
+-from queue import Queue
++from queue import Queue, Empty
+ from itertools import count
+ from threading import Thread
+ from dataclasses import dataclass
+@@ -38,6 +38,7 @@ from pebble.pool.base_pool import Worker, iter_chunks, run_initializer
+ from pebble.pool.base_pool import PoolContext, BasePool, Task, TaskPayload
+ from pebble.pool.base_pool import MapResults
+ from pebble.pool.base_pool import PoolStatus, ProcessMapFuture, map_results
++from pebble.pool.scheduler import ChannelConfig
+ from pebble.common import Result, ResultStatus, CONSTS
+ from pebble.common import ProcessExpired, ProcessFuture
+ from pebble.common.types import MultiprocessingContext, P, T
+@@ -68,8 +69,9 @@ class ProcessPool(BasePool):
+         initializer: Callable | None = None,
+         initargs: Iterable[Any] = (),
+         context: MultiprocessingContext = multiprocessing,
++        channels: Mapping[str, ChannelConfig] | None = None,
+     ):
+-        super().__init__(max_workers, max_tasks, initializer, initargs)
++        super().__init__(max_workers, max_tasks, initializer, initargs, channels)
+         self._pool_manager: PoolManager = PoolManager(self._context, context)
+         self._task_scheduler_loop: Thread | None = None
+         self._pool_manager_loop: Thread | None = None
+@@ -112,6 +114,7 @@ class ProcessPool(BasePool):
+         args: Iterable[Any] = (),
+         kwargs: Mapping[str, Any] = {},
+         timeout: float | None = None,
++        channel: str | None = None,
+     ) -> ProcessFuture[T]:
+         """Schedules *function* to be run the Pool.
+ 
+@@ -121,14 +124,18 @@ class ProcessPool(BasePool):
+         *timeout* is an integer, if expires the task will be terminated
+         and *Future.result()* will raise *TimeoutError*.
+ 
++        *channel* optionally routes the task to a named workload channel
++        configured at Pool construction.
++
+         A *pebble.ProcessFuture* object is returned.
+ 
+         """
+         self._check_pool_status()
++        self._context.scheduler.validate(channel)
+ 
+         future: ProcessFuture = ProcessFuture()
+         payload: TaskPayload = TaskPayload(function, args, kwargs)
+-        task: Task = Task(next(self._task_counter), future, timeout, payload)
++        task: Task = Task(next(self._task_counter), future, timeout, payload, channel)
+ 
+         self._context.task_queue.put(task)
+ 
+@@ -155,7 +162,8 @@ class ProcessPool(BasePool):
+         function: Callable[..., T],
+         *iterables: Iterable[Any],
+         timeout: float | None = None,
+-        chunksize: int = 1
++        chunksize: int = 1,
++        channel: str | None = None,
+     ) -> ProcessMapFuture[MapResults[T]]:
+         """Computes the *function* using arguments from
+         each of the iterables. Stops when the shortest iterable is exhausted.
+@@ -167,6 +175,9 @@ class ProcessPool(BasePool):
+         *chunksize* controls the size of the chunks the iterable will
+         be broken into before being passed to the function.
+ 
++        *channel* optionally routes all the chunks to a named workload
++        channel configured at Pool construction.
++
+         A *pebble.ProcessFuture* object is returned.
+ 
+         """
+@@ -176,7 +187,12 @@ class ProcessPool(BasePool):
+             raise ValueError("chunksize must be >= 1")
+ 
+         futures: List[ProcessFuture] = [
+-            self.schedule(process_chunk, args=(function, chunk), timeout=timeout)
++            self.schedule(
++                process_chunk,
++                args=(function, chunk),
++                timeout=timeout,
++                channel=channel,
++            )
+             for chunk in iter_chunks(zip(*iterables), chunksize)
+         ]
+         future: ProcessMapFuture = ProcessMapFuture(futures)
+@@ -185,20 +201,41 @@ class ProcessPool(BasePool):
+ 
+ 
+ def task_scheduler_loop(pool_manager: PoolManager):
+-    task_queue: Queue = pool_manager.context.task_queue
++    context: PoolContext = pool_manager.context
++    task_queue: Queue = context.task_queue
++    scheduler = context.scheduler
+ 
+     try:
+-        while pool_manager.context.alive and not GLOBAL_SHUTDOWN:
+-            task: Task | None = pool_manager.context.task_queue.get()
++        while context.alive and not GLOBAL_SHUTDOWN:
++            while True:
++                try:
++                    task: Task | None = task_queue.get_nowait()
++                except Empty:
++                    break
++
++                if task is None:  # Termination sentinel received
++                    task_queue.task_done()
++
++                    return
++                elif task.future.cancelled():
++                    task.set_running_or_notify_cancel()
++                    task_queue.task_done()
++                else:
++                    scheduler.admit(task)
+ 
+-            if task is not None:
+-                if task.future.cancelled():
++            while context.alive and not GLOBAL_SHUTDOWN:
++                task = scheduler.retrieve()
++
++                if task is None:
++                    break
++                elif task.future.cancelled():
+                     task.set_running_or_notify_cancel()
++                    scheduler.release(task)
+                     task_queue.task_done()
+                 else:
+                     pool_manager.schedule(task)
+-            else:
+-                task_queue.task_done()  # Termination sentinel received
++
++            scheduler.wait(CONSTS.sleep_unit)
+     except BrokenProcessPool as error:
+         pool_manager.handle_broken_pool(error)
+ 
+@@ -225,7 +262,7 @@ class PoolManager:
+ 
+     def __init__(self, context: PoolContext, mp_context: MultiprocessingContext):
+         self.context: PoolContext = context
+-        self.task_manager: TaskManager = TaskManager(context.task_queue.task_done)
++        self.task_manager: TaskManager = TaskManager(context)
+         self.worker_manager: WorkerManager = WorkerManager(
+             context.workers, context.worker_parameters, mp_context
+         )
+@@ -336,9 +373,10 @@ class TaskManager:
+     Timing out and cancelled tasks are handled as well.
+     """
+ 
+-    def __init__(self, task_done_callback: Callable):
++    def __init__(self, context: PoolContext):
++        self.context: PoolContext = context
+         self.tasks: Dict[int, Task] = {}
+-        self.task_done_callback: Callable = task_done_callback
++        self.task_done_callback: Callable = context.task_queue.task_done
+ 
+     def register(self, task: Task):
+         self.tasks[task.id] = task
+@@ -367,6 +405,7 @@ class TaskManager:
+             else:
+                 task.future.set_exception(result.value)
+ 
++            self.context.scheduler.release(task)
+             self.task_done_callback()
+ 
+     def task_problem(self, task_id: int, error: BaseException):
+@@ -425,7 +464,9 @@ class WorkerManager:
+ 
+     def dispatch(self, task: Task):
+         try:
+-            self.pool_channel.send(WorkerTask(task.id, task.payload))  # type: ignore[union-attr]
++            self.pool_channel.send(  # type: ignore[union-attr]
++                WorkerTask(task.id, task.channel, task.payload)
++            )
+         except PICKLING_ERRORS as error:
+             raise error
+         except OSError as error:
+@@ -638,6 +679,7 @@ class WorkerTask:
+     """A Task assigned to a worker."""
+ 
+     id: int
++    channel: str | None
+     payload: TaskPayload
+ 
+ 
+diff --git a/pebble/pool/scheduler.py b/pebble/pool/scheduler.py
+new file mode 100644
+index 0000000..deab337
+--- /dev/null
++++ b/pebble/pool/scheduler.py
+@@ -0,0 +1,209 @@
++# This file is part of Pebble.
++# Copyright (c) 2013-2026, Matteo Cafasso
++
++# Pebble is free software: you can redistribute it and/or modify
++# it under the terms of the GNU Lesser General Public License
++# as published by the Free Software Foundation,
++# either version 3 of the License, or (at your option) any later version.
++
++# Pebble is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU Lesser General Public License for more details.
++
++# You should have received a copy of the GNU Lesser General Public License
++# along with Pebble.  If not, see <http://www.gnu.org/licenses/>.
++
++from __future__ import annotations
++
++from collections import deque
++from threading import Condition
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Mapping, Deque
++
++if TYPE_CHECKING:
++    from pebble.pool.base_pool import Task
++
++
++# Tasks which do not declare a channel are routed to the default channel.
++DEFAULT_CHANNEL: str | None = None
++
++
++@dataclass(frozen=True)
++class ChannelConfig:
++    """Configuration of a named workload channel.
++
++    *max_concurrency* is the maximum amount of tasks belonging to the
++    channel which are allowed to be in flight (dispatched but not yet
++    completed) at any given time. If None, the channel is only bounded
++    by the Pool *max_workers*.
++
++    *weight* controls the share of workers assigned to the channel once
++    multiple channels have tasks ready to run. A channel with weight 3
++    is served three times as often as a channel with weight 1 within
++    each scheduling round.
++
++    """
++
++    max_concurrency: int | None = None
++    weight: int = 1
++
++
++class FairScheduler:
++    """Weighted fair scheduler enforcing per-channel concurrency limits.
++
++    Tasks are admitted into per-channel FIFO queues and retrieved through
++    a Deficit Round Robin discipline: each scheduling round, active
++    channels accumulate a deficit proportional to their weight and are
++    served as long as they hold deficit and are not blocked by their
++    concurrency limit. The round rotation ensures a channel continuously
++    submitting tasks cannot starve the other ready channels.
++
++    """
++
++    def __init__(
++        self,
++        channels: Mapping[str, ChannelConfig] | None = None,
++    ):
++        self._configs: dict[str | None, ChannelConfig] = {
++            DEFAULT_CHANNEL: ChannelConfig()
++        }
++        self._queues: dict[str | None, Deque[Task]] = {DEFAULT_CHANNEL: deque()}
++        self._deficit: dict[str | None, int] = {DEFAULT_CHANNEL: 0}
++        self._in_flight: dict[str | None, int] = {DEFAULT_CHANNEL: 0}
++        self._active: Deque[str | None] = deque()
++        self._active_channels: set[str | None] = set()
++        self._condition: Condition = Condition()
++
++        for name, config in (channels or {}).items():
++            self._register(name, config)
++
++    @property
++    def channel_names(self) -> tuple[str, ...]:
++        """Names of the configured named channels."""
++        return tuple(name for name in self._configs if isinstance(name, str))
++
++    def validate(self, channel: str | None):
++        """Raise ValueError if the channel is unknown to the scheduler."""
++        if channel not in self._configs:
++            names = ", ".join(self.channel_names) or "<none>"
++
++            raise ValueError(
++                f"Unknown channel {channel!r}, configured channels: {names}"
++            )
++
++    def admit(self, task: Task):
++        """Enqueue a task within its channel ready queue."""
++        self.validate(task.channel)
++
++        with self._condition:
++            self._queues[task.channel].append(task)
++
++            if task.channel not in self._active_channels:
++                self._active_channels.add(task.channel)
++                self._active.append(task.channel)
++
++            self._condition.notify()
++
++    def retrieve(self) -> Task | None:
++        """Return the next task allowed to run or None if none is admissible.
++
++        The per-channel concurrency limits are honored. The Pool-wide
++        amount of workers is not enforced here: unlimited channels keep
++        flowing into the workers queue as without channels configured.
++        Cancelled tasks are filtered out lazily and accounted for by
++        the caller through :meth:`release`.
++
++        """
++        with self._condition:
++            for _ in range(len(self._active)):
++                name = self._active[0]
++                config = self._configs[name]
++
++                if self._at_concurrency_limit(name, config):
++                    # Waiting for a slot, let the other channels run.
++                    # The channel deficit is retained for its next turn.
++                    self._active.rotate(-1)
++
++                    continue
++
++                if self._deficit[name] <= 0:
++                    self._deficit[name] += config.weight
++
++                queue = self._queues[name]
++
++                if not queue:
++                    self._deactivate(name)
++
++                    continue
++
++                task = queue.popleft()
++                self._deficit[name] -= 1
++                self._in_flight[name] += 1
++
++                if not queue:
++                    self._deactivate(name)
++                elif self._deficit[name] <= 0:
++                    # Quantum exhausted, give the other channels a turn.
++                    self._active.rotate(-1)
++
++                return task
++
++            return None
++
++    def release(self, task: Task):
++        """Release the in-flight slot held by the task.
++
++        Must be invoked once for every task returned by :meth:`retrieve`,
++        regardless of whether it was executed, cancelled or rejected.
++
++        """
++        with self._condition:
++            self._in_flight[task.channel] -= 1
++            self._condition.notify()
++
++    def wait(self, timeout: float | None = None):
++        """Wait until new tasks are admitted or slots are released."""
++        with self._condition:
++            self._condition.wait(timeout)
++
++    def in_flight(self, channel: str | None) -> int:
++        """Amount of in-flight tasks for the given channel."""
++        with self._condition:
++            return self._in_flight[channel]
++
++    def _register(self, name: str, config: ChannelConfig):
++        if not isinstance(name, str) or not name:
++            raise TypeError("Channel names must be non-empty strings")
++        if not isinstance(config, ChannelConfig):
++            raise TypeError("Channel configuration must be a ChannelConfig")
++        if config.max_concurrency is not None and (
++            not isinstance(config.max_concurrency, int)
++            or isinstance(config.max_concurrency, bool)
++            or config.max_concurrency < 1
++        ):
++            raise ValueError("Channel max_concurrency must be None or >= 1")
++        if (
++            not isinstance(config.weight, int)
++            or isinstance(config.weight, bool)
++            or config.weight < 1
++        ):
++            raise ValueError("Channel weight must be an integer >= 1")
++        if name in self._configs:
++            raise ValueError(f"Channel {name!r} is configured more than once")
++
++        self._configs[name] = config
++        self._queues[name] = deque()
++        self._deficit[name] = 0
++        self._in_flight[name] = 0
++
++    def _at_concurrency_limit(self, name: str | None, config: ChannelConfig) -> bool:
++        return (
++            config.max_concurrency is not None
++            and self._in_flight[name] >= config.max_concurrency
++        )
++
++    def _deactivate(self, name: str | None):
++        self._active.popleft()
++        self._active_channels.discard(name)
++        self._deficit[name] = 0
+diff --git a/pebble/pool/thread.py b/pebble/pool/thread.py
+index f7de360..6997028 100644
+--- a/pebble/pool/thread.py
++++ b/pebble/pool/thread.py
+@@ -19,7 +19,7 @@ from __future__ import annotations
+ import time
+ import multiprocessing
+ 
+-from queue import Queue
++from queue import Queue, Empty
+ from itertools import count
+ from threading import Thread
+ from concurrent.futures import Future
+@@ -31,6 +31,7 @@ from pebble.pool.base_pool import iter_chunks, run_initializer
+ from pebble.pool.base_pool import MapResults, Worker, Result
+ from pebble.pool.base_pool import PoolStatus, MapFuture, map_results
+ from pebble.pool.base_pool import PoolContext, BasePool, Task, TaskPayload
++from pebble.pool.scheduler import ChannelConfig
+ 
+ 
+ class ThreadPool(BasePool):
+@@ -52,19 +53,27 @@ class ThreadPool(BasePool):
+         max_tasks: int = 0,
+         initializer: Callable | None = None,
+         initargs: Iterable[Any] = (),
++        channels: Mapping[str, ChannelConfig] | None = None,
+     ):
+-        super().__init__(max_workers, max_tasks, initializer, initargs)
++        super().__init__(max_workers, max_tasks, initializer, initargs, channels)
+         self._pool_manager: PoolManager = PoolManager(self._context)
++        self._task_scheduler_loop: Thread | None = None
+         self._pool_manager_loop: Thread | None = None
+ 
+     def _start_pool(self):
+         with self._context.status_mutex:
+             if self._context.status == PoolStatus.CREATED:
+                 self._pool_manager.start()
++                self._task_scheduler_loop = launch_thread(
++                    None, task_scheduler_loop, True, self._pool_manager
++                )
+                 self._pool_manager_loop = launch_thread(
+                     None, pool_manager_loop, True, self._pool_manager
+                 )
+-                self._loops = (self._pool_manager_loop,)
++                self._loops = (
++                    self._task_scheduler_loop,
++                    self._pool_manager_loop,
++                )
+ 
+                 self._context.status = PoolStatus.RUNNING
+ 
+@@ -72,26 +81,33 @@ class ThreadPool(BasePool):
+         if self._pool_manager_loop is not None:
+             self._pool_manager_loop.join()
+         self._pool_manager.stop()
++        if self._task_scheduler_loop is not None:
++            self._task_scheduler_loop.join()
+ 
+     def schedule(
+         self,
+         function: Callable[..., T],
+         args: Iterable[Any] = (),
+         kwargs: Mapping[str, Any] = {},
++        channel: str | None = None,
+     ) -> Future[T]:
+         """Schedules *function* to be run the Pool.
+ 
+         *args* and *kwargs* will be forwareded to the scheduled function
+         respectively as arguments and keyword arguments.
+ 
++        *channel* optionally routes the task to a named workload channel
++        configured at Pool construction.
++
+         A *concurrent.futures.Future* object is returned.
+ 
+         """
+         self._check_pool_status()
++        self._context.scheduler.validate(channel)
+ 
+         future: Future = Future()
+         payload: TaskPayload = TaskPayload(function, args, kwargs)
+-        task: Task = Task(next(self._task_counter), future, None, payload)
++        task: Task = Task(next(self._task_counter), future, None, payload, channel)
+ 
+         self._context.task_queue.put(task)
+ 
+@@ -113,7 +129,8 @@ class ThreadPool(BasePool):
+         function: Callable[..., T],
+         *iterables: Iterable[Any],
+         timeout: float | None = None,
+-        chunksize: int = 1
++        chunksize: int = 1,
++        channel: str | None = None,
+     ) -> MapFuture[MapResults[T]]:
+         """Returns an iterator equivalent to map(function, iterables).
+ 
+@@ -121,6 +138,9 @@ class ThreadPool(BasePool):
+         be broken into before being passed to the function. If None
+         the size will be controlled by the Pool.
+ 
++        *channel* optionally routes all the chunks to a named workload
++        channel configured at Pool construction.
++
+         """
+         self._check_pool_status()
+ 
+@@ -128,7 +148,7 @@ class ThreadPool(BasePool):
+             raise ValueError("chunksize must be >= 1")
+ 
+         futures: List[Future] = [
+-            self.schedule(process_chunk, args=(function, chunk))
++            self.schedule(process_chunk, args=(function, chunk), channel=channel)
+             for chunk in iter_chunks(zip(*iterables), chunksize)
+         ]
+         future: MapFuture = MapFuture(futures)
+@@ -136,6 +156,52 @@ class ThreadPool(BasePool):
+         return map_results(future, timeout)
+ 
+ 
++def task_scheduler_loop(pool_manager: PoolManager):
++    """Moves tasks from the submission queue to the workers dispatch queue.
++
++    Tasks are routed through the FairScheduler which enforces the
++    per-channel concurrency limits and prevents any busy channel from
++    starving the other ready ones.
++
++    """
++    context: PoolContext = pool_manager.context
++    scheduler = context.scheduler
++
++    while True:
++        while True:
++            try:
++                task: Task | None = context.task_queue.get_nowait()
++            except Empty:
++                break
++
++            if task is None:  # Pool termination sentinel
++                context.task_queue.task_done()
++
++                return
++            elif task.future.cancelled():
++                task.set_running_or_notify_cancel()
++                context.task_queue.task_done()
++            else:
++                scheduler.admit(task)
++
++        if not context.alive:
++            return
++
++        while context.alive:
++            task = scheduler.retrieve()
++
++            if task is None:
++                break
++            elif task.future.cancelled():
++                task.set_running_or_notify_cancel()
++                scheduler.release(task)
++                context.task_queue.task_done()
++            else:
++                context.dispatch_queue.put(task)
++
++        scheduler.wait(CONSTS.sleep_unit)
++
++
+ def pool_manager_loop(pool_manager: PoolManager):
+     context: PoolContext = pool_manager.context
+ 
+@@ -153,8 +219,8 @@ class PoolManager:
+         self.create_workers()
+ 
+     def stop(self):
+-        for worker in self.workers:
+-            self.context.task_queue.put(None)
++        for _ in self.workers:
++            self.context.dispatch_queue.put(None)
+         for worker in tuple(self.workers):
+             self.join_worker(worker)
+ 
+@@ -182,7 +248,6 @@ class PoolManager:
+ 
+ def worker_thread(context: PoolContext):
+     """The worker thread routines."""
+-    queue: Queue[Task | None] = context.task_queue
+     parameters: Worker = context.worker_parameters
+ 
+     if parameters.initializer is not None:
+@@ -192,12 +257,13 @@ def worker_thread(context: PoolContext):
+ 
+     for task in get_next_task(context, parameters.max_tasks):
+         execute_next_task(task)
+-        queue.task_done()
++        context.scheduler.release(task)
++        context.task_queue.task_done()
+ 
+ 
+ def get_next_task(context: PoolContext, max_tasks: int):
+     counter: count = count()
+-    queue: Queue[Task | None] = context.task_queue
++    queue: Queue[Task | None] = context.dispatch_queue
+ 
+     while context.alive and (max_tasks == 0 or next(counter) < max_tasks):
+         task: Task | None = queue.get()
+@@ -205,7 +271,8 @@ def get_next_task(context: PoolContext, max_tasks: int):
+         if task is not None:
+             if task.future.cancelled():
+                 task.set_running_or_notify_cancel()
+-                queue.task_done()
++                context.scheduler.release(task)
++                context.task_queue.task_done()
+             else:
+                 yield task
+ 
+diff --git a/test/test_asynchronous_process_fork.py b/test/test_asynchronous_process_fork.py
+index e09d72d..9fb430e 100644
+--- a/test/test_asynchronous_process_fork.py
++++ b/test/test_asynchronous_process_fork.py
+@@ -10,6 +10,7 @@ import multiprocessing
+ from concurrent.futures import CancelledError, TimeoutError
+ 
+ from pebble import asynchronous, ProcessExpired, ProcessPool
++from pebble.pool.scheduler import ChannelConfig
+ 
+ 
+ # set start method
+@@ -447,3 +448,19 @@ class TestProcessAsynchronous(unittest.TestCase):
+             return await pool_decorated(1)
+ 
+         self.assertEqual(asyncio.run(test()), asyncio.run(test()))
++
++    def test_pool_channel_decorated(self):
++        """Pool asynchronous decorator honors the channel parameter."""
++        async def scenario():
++            with ProcessPool(
++                max_workers=2,
++                context=mp_context,
++                channels={"a": ChannelConfig(max_concurrency=1)},
++            ) as pool:
++                channel_decorated = asynchronous.process(
++                    not_decorated, pool=pool, channel="a"
++                )
++
++                return await channel_decorated(1, 1)
++
++        self.assertEqual(asyncio.run(scenario()), 2)
+diff --git a/test/test_asynchronous_process_forkserver.py b/test/test_asynchronous_process_forkserver.py
+index eecebb1..2e99d74 100644
+--- a/test/test_asynchronous_process_forkserver.py
++++ b/test/test_asynchronous_process_forkserver.py
+@@ -10,6 +10,7 @@ import multiprocessing
+ from concurrent.futures import CancelledError, TimeoutError
+ 
+ from pebble import asynchronous, ProcessExpired, ProcessPool
++from pebble.pool.scheduler import ChannelConfig
+ 
+ 
+ # set start method
+@@ -420,3 +421,19 @@ class TestProcessAsynchronous(unittest.TestCase):
+             return await pool_decorated(1, 1)
+ 
+         self.assertEqual(asyncio.run(test()), asyncio.run(test()))
++
++    def test_pool_channel_decorated(self):
++        """Pool asynchronous decorator honors the channel parameter."""
++        async def scenario():
++            with ProcessPool(
++                max_workers=2,
++                context=mp_context,
++                channels={"a": ChannelConfig(max_concurrency=1)},
++            ) as pool:
++                channel_decorated = asynchronous.process(
++                    not_decorated, pool=pool, channel="a"
++                )
++
++                return await channel_decorated(1, 1)
++
++        self.assertEqual(asyncio.run(scenario()), 2)
+diff --git a/test/test_asynchronous_process_spawn.py b/test/test_asynchronous_process_spawn.py
+index bc0b0ea..0ffbf32 100644
+--- a/test/test_asynchronous_process_spawn.py
++++ b/test/test_asynchronous_process_spawn.py
+@@ -10,6 +10,7 @@ import multiprocessing
+ from concurrent.futures import CancelledError, TimeoutError
+ 
+ from pebble import asynchronous, ProcessExpired, ProcessPool
++from pebble.pool.scheduler import ChannelConfig
+ 
+ 
+ # set start method
+@@ -420,3 +421,19 @@ class TestProcessAsynchronous(unittest.TestCase):
+             return await pool_decorated(1, 1)
+ 
+         self.assertEqual(asyncio.run(test()), asyncio.run(test()))
++
++    def test_pool_channel_decorated(self):
++        """Pool asynchronous decorator honors the channel parameter."""
++        async def scenario():
++            with ProcessPool(
++                max_workers=2,
++                context=mp_context,
++                channels={"a": ChannelConfig(max_concurrency=1)},
++            ) as pool:
++                channel_decorated = asynchronous.process(
++                    not_decorated, pool=pool, channel="a"
++                )
++
++                return await channel_decorated(1, 1)
++
++        self.assertEqual(asyncio.run(scenario()), 2)
+diff --git a/test/test_asynchronous_thread.py b/test/test_asynchronous_thread.py
+index 0dae8bd..384827e 100644
+--- a/test/test_asynchronous_thread.py
++++ b/test/test_asynchronous_thread.py
+@@ -5,6 +5,7 @@ import dataclasses
+ 
+ from pebble import ThreadPool
+ from pebble import asynchronous
++from pebble.pool.scheduler import ChannelConfig
+ 
+ 
+ def not_decorated(argument, keyword_argument=0):
+@@ -231,3 +232,18 @@ class TestThreadAsynchronous(unittest.TestCase):
+             return await pool_decorated(1)
+ 
+         self.assertEqual(asyncio.run(test()), asyncio.run(test()))
++
++    def test_pool_channel_decorated(self):
++        """Thread pool asynchronous decorator honors the channel parameter."""
++        async def scenario():
++            with ThreadPool(
++                max_workers=2,
++                channels={"a": ChannelConfig(max_concurrency=1)},
++            ) as pool:
++                channel_decorated = asynchronous.thread(
++                    not_decorated, pool=pool, channel="a"
++                )
++
++                return await channel_decorated(1, 1)
++
++        self.assertEqual(asyncio.run(scenario()), 2)
+diff --git a/test/test_concurrent_process_fork.py b/test/test_concurrent_process_fork.py
+index 8dbffda..9683ed2 100644
+--- a/test/test_concurrent_process_fork.py
++++ b/test/test_concurrent_process_fork.py
+@@ -9,6 +9,7 @@ import multiprocessing
+ from concurrent.futures import CancelledError, TimeoutError
+ 
+ from pebble import concurrent, ProcessExpired, ProcessPool
++from pebble.pool.scheduler import ChannelConfig
+ 
+ 
+ # set start method
+@@ -359,3 +360,21 @@ class TestProcessConcurrent(unittest.TestCase):
+         future1 = pool_decorated(1, 1)
+         future2 = pool_decorated(1, 1)
+         self.assertEqual(future1.result(), future2.result())
++
++    def test_pool_channel_decorated(self):
++        """Pool decorated function honors the channel parameter."""
++        with ProcessPool(
++            max_workers=2,
++            context=mp_context,
++            channels={"a": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            channel_decorated = concurrent.process(
++                not_decorated, pool=pool, channel="a"
++            )
++
++            self.assertEqual(channel_decorated(1, 1).result(), 2)
++
++            with self.assertRaises(ValueError):
++                concurrent.process(
++                    not_decorated, pool=pool, channel="b"
++                )(1)
+diff --git a/test/test_concurrent_process_forkserver.py b/test/test_concurrent_process_forkserver.py
+index f78b4d9..ca586a6 100644
+--- a/test/test_concurrent_process_forkserver.py
++++ b/test/test_concurrent_process_forkserver.py
+@@ -9,6 +9,7 @@ import multiprocessing
+ from concurrent.futures import CancelledError, TimeoutError
+ 
+ from pebble import concurrent, ProcessExpired, ProcessPool
++from pebble.pool.scheduler import ChannelConfig
+ 
+ 
+ # set start method
+@@ -299,3 +300,21 @@ class TestProcessConcurrent(unittest.TestCase):
+         future1 = pool_decorated(1, 1)
+         future2 = pool_decorated(1, 1)
+         self.assertEqual(future1.result(), future2.result())
++
++    def test_pool_channel_decorated(self):
++        """Pool decorated function honors the channel parameter."""
++        with ProcessPool(
++            max_workers=2,
++            context=mp_context,
++            channels={"a": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            channel_decorated = concurrent.process(
++                not_decorated, pool=pool, channel="a"
++            )
++
++            self.assertEqual(channel_decorated(1, 1).result(), 2)
++
++            with self.assertRaises(ValueError):
++                concurrent.process(
++                    not_decorated, pool=pool, channel="b"
++                )(1)
+diff --git a/test/test_concurrent_process_spawn.py b/test/test_concurrent_process_spawn.py
+index a25b6a8..29be85a 100644
+--- a/test/test_concurrent_process_spawn.py
++++ b/test/test_concurrent_process_spawn.py
+@@ -9,6 +9,7 @@ import multiprocessing
+ from concurrent.futures import CancelledError, TimeoutError
+ 
+ from pebble import concurrent, ProcessExpired, ProcessPool
++from pebble.pool.scheduler import ChannelConfig
+ 
+ 
+ # set start method
+@@ -299,3 +300,21 @@ class TestProcessConcurrent(unittest.TestCase):
+         future1 = pool_decorated(1, 1)
+         future2 = pool_decorated(1, 1)
+         self.assertEqual(future1.result(), future2.result())
++
++    def test_pool_channel_decorated(self):
++        """Pool decorated function honors the channel parameter."""
++        with ProcessPool(
++            max_workers=2,
++            context=mp_context,
++            channels={"a": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            channel_decorated = concurrent.process(
++                not_decorated, pool=pool, channel="a"
++            )
++
++            self.assertEqual(channel_decorated(1, 1).result(), 2)
++
++            with self.assertRaises(ValueError):
++                concurrent.process(
++                    not_decorated, pool=pool, channel="b"
++                )(1)
+diff --git a/test/test_concurrent_thread.py b/test/test_concurrent_thread.py
+index 00e53e3..75f6fc7 100644
+--- a/test/test_concurrent_thread.py
++++ b/test/test_concurrent_thread.py
+@@ -3,6 +3,7 @@ import threading
+ 
+ from pebble import concurrent
+ from pebble import ThreadPool
++from pebble.pool.scheduler import ChannelConfig
+ 
+ 
+ def not_decorated(argument, keyword_argument=0):
+@@ -175,3 +176,20 @@ class TestThreadConcurrent(unittest.TestCase):
+         future1 = pool_decorated(1, 1)
+         future2 = pool_decorated(1, 1)
+         self.assertEqual(future1.result(), future2.result())
++
++    def test_pool_channel_decorated(self):
++        """Thread pool decorated function honors the channel parameter."""
++        with ThreadPool(
++            max_workers=2,
++            channels={"a": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            channel_decorated = concurrent.thread(
++                not_decorated, pool=pool, channel="a"
++            )
++
++            self.assertEqual(channel_decorated(1, 1).result(), 2)
++
++            with self.assertRaises(ValueError):
++                concurrent.thread(
++                    not_decorated, pool=pool, channel="b"
++                )(1)
+diff --git a/test/test_pool_scheduler.py b/test/test_pool_scheduler.py
+new file mode 100644
+index 0000000..c6e6394
+--- /dev/null
++++ b/test/test_pool_scheduler.py
+@@ -0,0 +1,193 @@
++import unittest
++
++from concurrent.futures import Future
++
++from pebble.pool.base_pool import Task, TaskPayload
++from pebble.pool.scheduler import ChannelConfig, FairScheduler
++
++
++def _task(identifier: int, channel: str | None = None) -> Task:
++    return Task(
++        identifier,
++        Future(),
++        None,
++        TaskPayload(lambda: None, (), {}),
++        channel,
++    )
++
++
++class TestFairScheduler(unittest.TestCase):
++    def test_default_channel_routes_tasks(self):
++        """Tasks without channel flow through the default channel."""
++        scheduler = FairScheduler()
++
++        first = _task(1)
++        second = _task(2)
++        scheduler.admit(first)
++        scheduler.admit(second)
++
++        self.assertIs(scheduler.retrieve(), first)
++        self.assertIs(scheduler.retrieve(), second)
++        self.assertIsNone(scheduler.retrieve())
++
++    def test_unknown_channel_rejected(self):
++        """Admitting or validating an unknown channel raises ValueError."""
++        scheduler = FairScheduler({"a": ChannelConfig()})
++
++        with self.assertRaises(ValueError):
++            scheduler.admit(_task(1, "b"))
++        with self.assertRaises(ValueError):
++            scheduler.validate("b")
++
++        scheduler.validate(None)
++        scheduler.validate("a")
++
++    def test_invalid_channel_configurations(self):
++        """Invalid channel definitions are rejected at construction."""
++        for channels, error in (
++            ({"a": ChannelConfig(max_concurrency=0)}, ValueError),
++            ({"a": ChannelConfig(max_concurrency=True)}, ValueError),
++            ({"a": ChannelConfig(weight=0)}, ValueError),
++            ({"a": ChannelConfig(weight=-1)}, ValueError),
++            ({"a": ChannelConfig(weight=2.0)}, ValueError),
++            ({"": ChannelConfig()}, TypeError),
++            ({1: ChannelConfig()}, TypeError),
++        ):
++            with self.assertRaises(error):
++                FairScheduler(channels)
++
++    def test_concurrency_limit_blocks_channel(self):
++        """A channel does not dispatch beyond its concurrency limit."""
++        scheduler = FairScheduler({"a": ChannelConfig(max_concurrency=1)})
++
++        scheduler.admit(_task(1, "a"))
++        scheduler.admit(_task(2, "a"))
++
++        first = scheduler.retrieve()
++        self.assertEqual(first.id, 1)
++        self.assertEqual(scheduler.in_flight("a"), 1)
++
++        # The channel reached its limit, no further task is admissible.
++        self.assertIsNone(scheduler.retrieve())
++
++        scheduler.release(first)
++        self.assertEqual(scheduler.in_flight("a"), 0)
++
++        second = scheduler.retrieve()
++        self.assertEqual(second.id, 2)
++
++    def test_other_channels_served_while_one_blocked(self):
++        """A capped channel does not block the other ready channels."""
++        scheduler = FairScheduler(
++            {
++                "a": ChannelConfig(max_concurrency=1),
++                "b": ChannelConfig(max_concurrency=1),
++            }
++        )
++
++        scheduler.admit(_task(1, "a"))
++        scheduler.admit(_task(2, "a"))
++        scheduler.admit(_task(3, "b"))
++
++        a_task = scheduler.retrieve()
++        self.assertEqual(a_task.channel, "a")
++
++        # "a" is capped, the scheduler rotates and serves "b".
++        b_task = scheduler.retrieve()
++        self.assertEqual(b_task.channel, "b")
++
++        # Both channels capped now, nothing can be admitted.
++        self.assertIsNone(scheduler.retrieve())
++
++        scheduler.release(a_task)
++
++        next_a = scheduler.retrieve()
++        self.assertEqual(next_a.id, 2)
++        self.assertEqual(next_a.channel, "a")
++
++    def test_weighted_round_robin_sequence(self):
++        """Weights control the service ratio within each round."""
++        scheduler = FairScheduler(
++            {
++                "a": ChannelConfig(weight=3),
++                "b": ChannelConfig(weight=1),
++            }
++        )
++
++        for identifier in range(4):
++            scheduler.admit(_task(identifier, "a"))
++        for identifier in range(4, 8):
++            scheduler.admit(_task(identifier, "b"))
++
++        order = []
++
++        while True:
++            task = scheduler.retrieve()
++
++            if task is None:
++                break
++
++            order.append(task.channel)
++
++        # "a" is served three times, then "b" once before the next round.
++        self.assertEqual(order, ["a", "a", "a", "b", "a", "b", "b", "b"])
++
++    def test_continuous_channel_cannot_starve_others(self):
++        """A channel admitting tasks continuously cannot monopolize workers."""
++        scheduler = FairScheduler(
++            {
++                "big": ChannelConfig(weight=1),
++                "small": ChannelConfig(weight=1),
++            }
++        )
++
++        for identifier in range(100):
++            scheduler.admit(_task(identifier, "big"))
++        scheduler.admit(_task(1000, "small"))
++
++        first = scheduler.retrieve()
++        second = scheduler.retrieve()
++
++        self.assertEqual(first.channel, "big")
++        # The round rotation serves the small channel within the first round.
++        self.assertEqual(second.channel, "small")
++
++    def test_default_channel_is_independent(self):
++        """The default channel has its own limit counters."""
++        scheduler = FairScheduler(
++            {"a": ChannelConfig(max_concurrency=1)}
++        )
++
++        scheduler.admit(_task(1, "a"))
++        scheduler.admit(_task(2, "a"))
++        scheduler.admit(_task(3, None))
++        scheduler.admit(_task(4, None))
++
++        self.assertEqual(scheduler.retrieve().channel, "a")
++        # "a" is capped but the unlimited default channel keeps flowing.
++        self.assertEqual(scheduler.retrieve().channel, None)
++        self.assertEqual(scheduler.retrieve().channel, None)
++        self.assertIsNone(scheduler.retrieve())
++
++    def test_in_flight_accounting_balances_on_release(self):
++        """Cancelled tasks returned by retrieve balance out on release."""
++        scheduler = FairScheduler({"a": ChannelConfig(max_concurrency=2)})
++
++        first = _task(1, "a")
++        second = _task(2, "a")
++        scheduler.admit(first)
++        scheduler.admit(second)
++
++        self.assertIs(scheduler.retrieve(), first)
++        self.assertIs(scheduler.retrieve(), second)
++        self.assertEqual(scheduler.in_flight("a"), 2)
++
++        first.future.cancel()
++        scheduler.release(first)
++        scheduler.release(second)
++
++        self.assertEqual(scheduler.in_flight("a"), 0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/test_process_pool_fork.py b/test/test_process_pool_fork.py
+index b1265f6..01acc2f 100644
+--- a/test/test_process_pool_fork.py
++++ b/test/test_process_pool_fork.py
+@@ -17,6 +17,7 @@ from concurrent.futures import CancelledError, TimeoutError
+ import pebble
+ from pebble import ProcessPool, ProcessExpired
+ from pebble.pool.base_pool import PoolStatus
++from pebble.pool.scheduler import ChannelConfig
+ 
+ 
+ # set start method
+@@ -113,6 +114,45 @@ def suicide_function():
+     os._exit(1)
+ 
+ 
++class ProcessConcurrencyRecorder:
++    """Tracks per-channel concurrency from within worker processes."""
++
++    def __init__(self, manager):
++        self.lock = manager.Lock()
++        self.active = manager.dict()
++        self.max_seen = manager.dict()
++        self.order = manager.list()
++
++    def run(self, channel, gate=None, delay=0.02):
++        with self.lock:
++            current = self.active.get(channel, 0) + 1
++            self.active[channel] = current
++            self.max_seen[channel] = max(
++                self.max_seen.get(channel, 0), current
++            )
++            self.order.append(channel)
++
++        if gate is not None:
++            gate.wait(10)
++
++        time.sleep(delay)
++
++        with self.lock:
++            self.active[channel] = self.active[channel] - 1
++
++        return channel
++
++
++def process_recorder_function(recorder, channel, gate=None, delay=0.02):
++    return recorder.run(channel, gate, delay)
++
++
++def process_slow_label_function(label, delay=0.1):
++    time.sleep(delay)
++
++    return label
++
++
+ def process_function():
+     p = multiprocessing.Process(target=function, args=[1])
+     p.start()
+@@ -927,3 +967,190 @@ class TestProcessPoolDeadlockOnCancelLargeData(unittest.TestCase):
+             for f in futures:
+                 f.cancel()
+             pool.stop()
++
++
++
++@unittest.skipIf(not supported, "Start method is not supported")
++class TestProcessPoolChannels(unittest.TestCase):
++    def test_process_pool_channel_result(self):
++        """Process Pool tasks scheduled on a channel execute normally."""
++        with ProcessPool(
++            max_workers=2,
++            context=mp_context,
++            channels={"a": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            future = pool.schedule(
++                function,
++                args=[1],
++                kwargs={"keyword_argument": 1},
++                channel="a",
++            )
++
++        self.assertEqual(future.result(), 2)
++
++    def test_process_pool_unknown_channel(self):
++        """Scheduling on an undeclared channel raises ValueError."""
++        with ProcessPool(
++            context=mp_context,
++            channels={"a": ChannelConfig()},
++        ) as pool:
++            with self.assertRaises(ValueError):
++                pool.schedule(function, channel="b")
++
++    def test_process_pool_channel_concurrency_limit(self):
++        """The channel concurrency limit is never exceeded."""
++        with multiprocessing.Manager() as manager:
++            recorder = ProcessConcurrencyRecorder(manager)
++
++            with ProcessPool(
++                max_workers=4,
++                context=mp_context,
++                channels={"limited": ChannelConfig(max_concurrency=1)},
++            ) as pool:
++                limited = [
++                    pool.schedule(
++                        process_recorder_function,
++                        args=(recorder, "limited"),
++                        channel="limited",
++                    )
++                    for _ in range(4)
++                ]
++                default = [
++                    pool.schedule(
++                        process_recorder_function,
++                        args=(recorder, "default"),
++                    )
++                    for _ in range(4)
++                ]
++
++                for future in limited + default:
++                    future.result(timeout=30)
++
++            self.assertEqual(recorder.max_seen["limited"], 1)
++            self.assertGreaterEqual(recorder.max_seen["default"], 2)
++
++    def test_process_pool_channel_fairness_no_starvation(self):
++        """A large backlog cannot starve a task of another channel."""
++        completion_order = []
++
++        def record(label):
++            def callback(_):
++                completion_order.append(label)
++
++            return callback
++
++        with ProcessPool(
++            max_workers=3,
++            context=mp_context,
++            channels={
++                "big": ChannelConfig(max_concurrency=3, weight=1),
++                "small": ChannelConfig(max_concurrency=1, weight=1),
++            },
++        ) as pool:
++            big_futures = [
++                pool.schedule(
++                    process_slow_label_function,
++                    args=("big",),
++                    channel="big",
++                )
++                for _ in range(12)
++            ]
++            small_future = pool.schedule(
++                process_slow_label_function,
++                args=("small",),
++                channel="small",
++            )
++
++            for future in big_futures:
++                future.add_done_callback(record("big"))
++            small_future.add_done_callback(record("small"))
++
++            self.assertEqual(small_future.result(timeout=30), "small")
++            for future in big_futures:
++                future.result(timeout=30)
++
++        # The small channel is served within the first rounds instead
++        # of waiting for the whole big backlog to be processed.
++        self.assertLessEqual(completion_order.index("small"), 6)
++
++    def test_process_pool_map_keeps_channel(self):
++        """All the map chunks inherit the channel of the map call."""
++        with multiprocessing.Manager() as manager:
++            recorder = ProcessConcurrencyRecorder(manager)
++
++            with ProcessPool(
++                max_workers=4,
++                context=mp_context,
++                channels={"mapped": ChannelConfig(max_concurrency=1)},
++            ) as pool:
++                future = pool.map(
++                    process_recorder_function,
++                    [recorder] * 6,
++                    ["mapped"] * 6,
++                    chunksize=2,
++                    channel="mapped",
++                )
++
++                self.assertEqual(list(future.result()), ["mapped"] * 6)
++
++            self.assertEqual(recorder.max_seen["mapped"], 1)
++
++    def test_process_pool_channel_cancel(self):
++        """Cancelling a queued channel task frees its channel slot."""
++        with ProcessPool(
++            max_workers=1,
++            context=mp_context,
++            channels={"a": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            running = pool.schedule(long_function, channel="a")
++            queued = pool.schedule(long_function, channel="a")
++            time.sleep(0.3)
++
++            self.assertTrue(queued.cancel())
++
++            with self.assertRaises(CancelledError):
++                queued.result()
++
++            following = pool.schedule(function, args=[1], channel="a")
++            self.assertEqual(following.result(timeout=30), 1)
++            running.result(timeout=30)
++
++    def test_process_pool_channel_worker_restart(self):
++        """Pending tasks keep their channel across worker restarts."""
++        with multiprocessing.Manager() as manager:
++            recorder = ProcessConcurrencyRecorder(manager)
++
++            with ProcessPool(
++                max_workers=2,
++                context=mp_context,
++                channels={
++                    "a": ChannelConfig(max_concurrency=1),
++                    "b": ChannelConfig(max_concurrency=2),
++                },
++            ) as pool:
++                dying = pool.schedule(suicide_function, channel="a")
++                a_futures = [
++                    pool.schedule(
++                        process_recorder_function,
++                        args=(recorder, "a"),
++                        channel="a",
++                    )
++                    for _ in range(4)
++                ]
++                b_futures = [
++                    pool.schedule(
++                        process_recorder_function,
++                        args=(recorder, "b"),
++                        channel="b",
++                    )
++                    for _ in range(3)
++                ]
++
++                with self.assertRaises(ProcessExpired):
++                    dying.result(timeout=30)
++
++                for future in a_futures + b_futures:
++                    future.result(timeout=30)
++
++            self.assertEqual(recorder.max_seen["a"], 1)
++            self.assertLessEqual(recorder.max_seen["b"], 2)
+diff --git a/test/test_process_pool_forkserver.py b/test/test_process_pool_forkserver.py
+index 4b3fd7c..e683513 100644
+--- a/test/test_process_pool_forkserver.py
++++ b/test/test_process_pool_forkserver.py
+@@ -17,6 +17,7 @@ from concurrent.futures import CancelledError, TimeoutError
+ import pebble
+ from pebble import ProcessPool, ProcessExpired
+ from pebble.pool.base_pool import PoolStatus
++from pebble.pool.scheduler import ChannelConfig
+ 
+ 
+ # set start method
+@@ -115,6 +116,47 @@ def suicide_function():
+     os._exit(1)
+ 
+ 
++class ProcessConcurrencyRecorder:
++    """Tracks per-channel concurrency from within worker processes."""
++
++    def __init__(self, manager):
++        self.lock = manager.Lock()
++        self.active = manager.dict()
++        self.max_seen = manager.dict()
++        self.order = manager.list()
++
++    def run(self, channel, gate=None, delay=0.02):
++        with self.lock:
++            current = self.active.get(channel, 0) + 1
++            self.active[channel] = current
++            self.max_seen[channel] = max(
++                self.max_seen.get(channel, 0), current
++            )
++            self.order.append(channel)
++
++        if gate is not None:
++            gate.wait(10)
++
++        time.sleep(delay)
++
++        with self.lock:
++            self.active[channel] = self.active[channel] - 1
++
++        return channel
++
++
++def process_recorder_function(recorder, channel, gate=None, delay=0.02):
++    return recorder.run(channel, gate, delay)
++
++
++def process_slow_label_function(label, delay=0.1):
++    time.sleep(delay)
++
++    return label
++
++
++
++
+ def process_function():
+     p = multiprocessing.Process(target=function, args=[1])
+     p.start()
+@@ -957,3 +999,189 @@ class TestProcessPoolDeadlockOnCancelLargeData(unittest.TestCase):
+             for f in futures:
+                 f.cancel()
+             pool.stop()
++
++
++@unittest.skipIf(not supported, "Start method is not supported")
++class TestProcessPoolChannels(unittest.TestCase):
++    def test_process_pool_channel_result(self):
++        """Process Pool tasks scheduled on a channel execute normally."""
++        with ProcessPool(
++            max_workers=2,
++            context=mp_context,
++            channels={"a": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            future = pool.schedule(
++                function,
++                args=[1],
++                kwargs={"keyword_argument": 1},
++                channel="a",
++            )
++
++        self.assertEqual(future.result(), 2)
++
++    def test_process_pool_unknown_channel(self):
++        """Scheduling on an undeclared channel raises ValueError."""
++        with ProcessPool(
++            context=mp_context,
++            channels={"a": ChannelConfig()},
++        ) as pool:
++            with self.assertRaises(ValueError):
++                pool.schedule(function, channel="b")
++
++    def test_process_pool_channel_concurrency_limit(self):
++        """The channel concurrency limit is never exceeded."""
++        with multiprocessing.Manager() as manager:
++            recorder = ProcessConcurrencyRecorder(manager)
++
++            with ProcessPool(
++                max_workers=4,
++                context=mp_context,
++                channels={"limited": ChannelConfig(max_concurrency=1)},
++            ) as pool:
++                limited = [
++                    pool.schedule(
++                        process_recorder_function,
++                        args=(recorder, "limited"),
++                        channel="limited",
++                    )
++                    for _ in range(4)
++                ]
++                default = [
++                    pool.schedule(
++                        process_recorder_function,
++                        args=(recorder, "default"),
++                    )
++                    for _ in range(4)
++                ]
++
++                for future in limited + default:
++                    future.result(timeout=30)
++
++            self.assertEqual(recorder.max_seen["limited"], 1)
++            self.assertGreaterEqual(recorder.max_seen["default"], 2)
++
++    def test_process_pool_channel_fairness_no_starvation(self):
++        """A large backlog cannot starve a task of another channel."""
++        completion_order = []
++
++        def record(label):
++            def callback(_):
++                completion_order.append(label)
++
++            return callback
++
++        with ProcessPool(
++            max_workers=3,
++            context=mp_context,
++            channels={
++                "big": ChannelConfig(max_concurrency=3, weight=1),
++                "small": ChannelConfig(max_concurrency=1, weight=1),
++            },
++        ) as pool:
++            big_futures = [
++                pool.schedule(
++                    process_slow_label_function,
++                    args=("big",),
++                    channel="big",
++                )
++                for _ in range(12)
++            ]
++            small_future = pool.schedule(
++                process_slow_label_function,
++                args=("small",),
++                channel="small",
++            )
++
++            for future in big_futures:
++                future.add_done_callback(record("big"))
++            small_future.add_done_callback(record("small"))
++
++            self.assertEqual(small_future.result(timeout=30), "small")
++            for future in big_futures:
++                future.result(timeout=30)
++
++        # The small channel is served within the first rounds instead
++        # of waiting for the whole big backlog to be processed.
++        self.assertLessEqual(completion_order.index("small"), 6)
++
++    def test_process_pool_map_keeps_channel(self):
++        """All the map chunks inherit the channel of the map call."""
++        with multiprocessing.Manager() as manager:
++            recorder = ProcessConcurrencyRecorder(manager)
++
++            with ProcessPool(
++                max_workers=4,
++                context=mp_context,
++                channels={"mapped": ChannelConfig(max_concurrency=1)},
++            ) as pool:
++                future = pool.map(
++                    process_recorder_function,
++                    [recorder] * 6,
++                    ["mapped"] * 6,
++                    chunksize=2,
++                    channel="mapped",
++                )
++
++                self.assertEqual(list(future.result()), ["mapped"] * 6)
++
++            self.assertEqual(recorder.max_seen["mapped"], 1)
++
++    def test_process_pool_channel_cancel(self):
++        """Cancelling a queued channel task frees its channel slot."""
++        with ProcessPool(
++            max_workers=1,
++            context=mp_context,
++            channels={"a": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            running = pool.schedule(long_function, channel="a")
++            queued = pool.schedule(long_function, channel="a")
++            time.sleep(0.3)
++
++            self.assertTrue(queued.cancel())
++
++            with self.assertRaises(CancelledError):
++                queued.result()
++
++            following = pool.schedule(function, args=[1], channel="a")
++            self.assertEqual(following.result(timeout=30), 1)
++            running.result(timeout=30)
++
++    def test_process_pool_channel_worker_restart(self):
++        """Pending tasks keep their channel across worker restarts."""
++        with multiprocessing.Manager() as manager:
++            recorder = ProcessConcurrencyRecorder(manager)
++
++            with ProcessPool(
++                max_workers=2,
++                context=mp_context,
++                channels={
++                    "a": ChannelConfig(max_concurrency=1),
++                    "b": ChannelConfig(max_concurrency=2),
++                },
++            ) as pool:
++                dying = pool.schedule(suicide_function, channel="a")
++                a_futures = [
++                    pool.schedule(
++                        process_recorder_function,
++                        args=(recorder, "a"),
++                        channel="a",
++                    )
++                    for _ in range(4)
++                ]
++                b_futures = [
++                    pool.schedule(
++                        process_recorder_function,
++                        args=(recorder, "b"),
++                        channel="b",
++                    )
++                    for _ in range(3)
++                ]
++
++                with self.assertRaises(ProcessExpired):
++                    dying.result(timeout=30)
++
++                for future in a_futures + b_futures:
++                    future.result(timeout=30)
++
++            self.assertEqual(recorder.max_seen["a"], 1)
++            self.assertLessEqual(recorder.max_seen["b"], 2)
+diff --git a/test/test_process_pool_spawn.py b/test/test_process_pool_spawn.py
+index e544eec..a34c628 100644
+--- a/test/test_process_pool_spawn.py
++++ b/test/test_process_pool_spawn.py
+@@ -17,6 +17,7 @@ from concurrent.futures import CancelledError, TimeoutError
+ import pebble
+ from pebble import ProcessPool, ProcessExpired
+ from pebble.pool.base_pool import PoolStatus
++from pebble.pool.scheduler import ChannelConfig
+ 
+ 
+ # set start method
+@@ -113,6 +114,47 @@ def suicide_function():
+     os._exit(1)
+ 
+ 
++class ProcessConcurrencyRecorder:
++    """Tracks per-channel concurrency from within worker processes."""
++
++    def __init__(self, manager):
++        self.lock = manager.Lock()
++        self.active = manager.dict()
++        self.max_seen = manager.dict()
++        self.order = manager.list()
++
++    def run(self, channel, gate=None, delay=0.02):
++        with self.lock:
++            current = self.active.get(channel, 0) + 1
++            self.active[channel] = current
++            self.max_seen[channel] = max(
++                self.max_seen.get(channel, 0), current
++            )
++            self.order.append(channel)
++
++        if gate is not None:
++            gate.wait(10)
++
++        time.sleep(delay)
++
++        with self.lock:
++            self.active[channel] = self.active[channel] - 1
++
++        return channel
++
++
++def process_recorder_function(recorder, channel, gate=None, delay=0.02):
++    return recorder.run(channel, gate, delay)
++
++
++def process_slow_label_function(label, delay=0.1):
++    time.sleep(delay)
++
++    return label
++
++
++
++
+ def process_function():
+     p = multiprocessing.Process(target=function, args=[1])
+     p.start()
+@@ -930,3 +972,189 @@ class TestProcessPoolDeadlockOnCancelLargeData(unittest.TestCase):
+             for f in futures:
+                 f.cancel()
+             pool.stop()
++
++
++@unittest.skipIf(not supported, "Start method is not supported")
++class TestProcessPoolChannels(unittest.TestCase):
++    def test_process_pool_channel_result(self):
++        """Process Pool tasks scheduled on a channel execute normally."""
++        with ProcessPool(
++            max_workers=2,
++            context=mp_context,
++            channels={"a": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            future = pool.schedule(
++                function,
++                args=[1],
++                kwargs={"keyword_argument": 1},
++                channel="a",
++            )
++
++        self.assertEqual(future.result(), 2)
++
++    def test_process_pool_unknown_channel(self):
++        """Scheduling on an undeclared channel raises ValueError."""
++        with ProcessPool(
++            context=mp_context,
++            channels={"a": ChannelConfig()},
++        ) as pool:
++            with self.assertRaises(ValueError):
++                pool.schedule(function, channel="b")
++
++    def test_process_pool_channel_concurrency_limit(self):
++        """The channel concurrency limit is never exceeded."""
++        with multiprocessing.Manager() as manager:
++            recorder = ProcessConcurrencyRecorder(manager)
++
++            with ProcessPool(
++                max_workers=4,
++                context=mp_context,
++                channels={"limited": ChannelConfig(max_concurrency=1)},
++            ) as pool:
++                limited = [
++                    pool.schedule(
++                        process_recorder_function,
++                        args=(recorder, "limited"),
++                        channel="limited",
++                    )
++                    for _ in range(4)
++                ]
++                default = [
++                    pool.schedule(
++                        process_recorder_function,
++                        args=(recorder, "default"),
++                    )
++                    for _ in range(4)
++                ]
++
++                for future in limited + default:
++                    future.result(timeout=30)
++
++            self.assertEqual(recorder.max_seen["limited"], 1)
++            self.assertGreaterEqual(recorder.max_seen["default"], 2)
++
++    def test_process_pool_channel_fairness_no_starvation(self):
++        """A large backlog cannot starve a task of another channel."""
++        completion_order = []
++
++        def record(label):
++            def callback(_):
++                completion_order.append(label)
++
++            return callback
++
++        with ProcessPool(
++            max_workers=3,
++            context=mp_context,
++            channels={
++                "big": ChannelConfig(max_concurrency=3, weight=1),
++                "small": ChannelConfig(max_concurrency=1, weight=1),
++            },
++        ) as pool:
++            big_futures = [
++                pool.schedule(
++                    process_slow_label_function,
++                    args=("big",),
++                    channel="big",
++                )
++                for _ in range(12)
++            ]
++            small_future = pool.schedule(
++                process_slow_label_function,
++                args=("small",),
++                channel="small",
++            )
++
++            for future in big_futures:
++                future.add_done_callback(record("big"))
++            small_future.add_done_callback(record("small"))
++
++            self.assertEqual(small_future.result(timeout=30), "small")
++            for future in big_futures:
++                future.result(timeout=30)
++
++        # The small channel is served within the first rounds instead
++        # of waiting for the whole big backlog to be processed.
++        self.assertLessEqual(completion_order.index("small"), 6)
++
++    def test_process_pool_map_keeps_channel(self):
++        """All the map chunks inherit the channel of the map call."""
++        with multiprocessing.Manager() as manager:
++            recorder = ProcessConcurrencyRecorder(manager)
++
++            with ProcessPool(
++                max_workers=4,
++                context=mp_context,
++                channels={"mapped": ChannelConfig(max_concurrency=1)},
++            ) as pool:
++                future = pool.map(
++                    process_recorder_function,
++                    [recorder] * 6,
++                    ["mapped"] * 6,
++                    chunksize=2,
++                    channel="mapped",
++                )
++
++                self.assertEqual(list(future.result()), ["mapped"] * 6)
++
++            self.assertEqual(recorder.max_seen["mapped"], 1)
++
++    def test_process_pool_channel_cancel(self):
++        """Cancelling a queued channel task frees its channel slot."""
++        with ProcessPool(
++            max_workers=1,
++            context=mp_context,
++            channels={"a": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            running = pool.schedule(long_function, channel="a")
++            queued = pool.schedule(long_function, channel="a")
++            time.sleep(0.3)
++
++            self.assertTrue(queued.cancel())
++
++            with self.assertRaises(CancelledError):
++                queued.result()
++
++            following = pool.schedule(function, args=[1], channel="a")
++            self.assertEqual(following.result(timeout=30), 1)
++            running.result(timeout=30)
++
++    def test_process_pool_channel_worker_restart(self):
++        """Pending tasks keep their channel across worker restarts."""
++        with multiprocessing.Manager() as manager:
++            recorder = ProcessConcurrencyRecorder(manager)
++
++            with ProcessPool(
++                max_workers=2,
++                context=mp_context,
++                channels={
++                    "a": ChannelConfig(max_concurrency=1),
++                    "b": ChannelConfig(max_concurrency=2),
++                },
++            ) as pool:
++                dying = pool.schedule(suicide_function, channel="a")
++                a_futures = [
++                    pool.schedule(
++                        process_recorder_function,
++                        args=(recorder, "a"),
++                        channel="a",
++                    )
++                    for _ in range(4)
++                ]
++                b_futures = [
++                    pool.schedule(
++                        process_recorder_function,
++                        args=(recorder, "b"),
++                        channel="b",
++                    )
++                    for _ in range(3)
++                ]
++
++                with self.assertRaises(ProcessExpired):
++                    dying.result(timeout=30)
++
++                for future in a_futures + b_futures:
++                    future.result(timeout=30)
++
++            self.assertEqual(recorder.max_seen["a"], 1)
++            self.assertLessEqual(recorder.max_seen["b"], 2)
+diff --git a/test/test_thread_pool.py b/test/test_thread_pool.py
+index d4f1c69..4077b0e 100644
+--- a/test/test_thread_pool.py
++++ b/test/test_thread_pool.py
+@@ -7,8 +7,9 @@ import dataclasses
+ from unittest import mock
+ from concurrent.futures import CancelledError, TimeoutError
+ 
+-from pebble import ThreadPool
++from pebble import ThreadPool, concurrent
+ from pebble.pool.base_pool import PoolStatus
++from pebble.pool.scheduler import ChannelConfig
+ 
+ initarg = 0
+ 
+@@ -63,6 +64,42 @@ def dead_manager_loop(*args, **kwargs):
+     time.sleep(0.1)
+ 
+ 
++class ConcurrencyRecorder:
++    """Tracks the maximum amount of concurrent tasks per channel."""
++
++    def __init__(self):
++        self.lock = threading.Lock()
++        self.active = {}
++        self.max_seen = {}
++        self.order = []
++
++    def run(self, channel, gate=None, delay=0.001):
++        with self.lock:
++            current = self.active.get(channel, 0) + 1
++            self.active[channel] = current
++            self.max_seen[channel] = max(self.max_seen.get(channel, 0), current)
++            self.order.append(channel)
++
++        if gate is not None:
++            gate.wait(5)
++
++        time.sleep(delay)
++
++        with self.lock:
++            self.active[channel] -= 1
++
++        return channel
++
++
++def recorder_function(recorder, channel, gate=None, delay=0.001):
++    return recorder.run(channel, gate, delay)
++
++
++def flood(pool, recorder, channel, stop_event):
++    while not stop_event.is_set():
++        pool.schedule(recorder_function, args=(recorder, channel), channel=channel)
++
++
+ class TestThreadPool(unittest.TestCase):
+     def setUp(self):
+         global initarg
+@@ -502,3 +539,209 @@ class TestAsyncIOThreadPool(unittest.TestCase):
+         with ThreadPool(max_workers=1) as pool:
+             asyncio.run(test(pool))
+             self.assertTrue(isinstance(self.exception, asyncio.CancelledError))
++
++
++class TestThreadPoolChannels(unittest.TestCase):
++    def test_thread_pool_channel_result(self):
++        """Tasks scheduled on a channel are executed normally."""
++        with ThreadPool(
++            max_workers=2,
++            channels={"a": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            future = pool.schedule(
++                function, args=[1], kwargs={"keyword_argument": 1},
++                channel="a",
++            )
++
++        self.assertEqual(future.result(), 2)
++
++    def test_thread_pool_unknown_channel(self):
++        """Scheduling on an undeclared channel raises ValueError."""
++        with ThreadPool(channels={"a": ChannelConfig()}) as pool:
++            with self.assertRaises(ValueError):
++                pool.schedule(function, channel="b")
++
++    def test_thread_pool_channel_concurrency_limit(self):
++        """The channel concurrency limit is never exceeded."""
++        recorder = ConcurrencyRecorder()
++
++        with ThreadPool(
++            max_workers=4,
++            channels={"limited": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            limited = [
++                pool.schedule(
++                    recorder_function, args=(recorder, "limited"),
++                    channel="limited",
++                )
++                for _ in range(8)
++            ]
++            default = [
++                pool.schedule(recorder_function, args=(recorder, "default"))
++                for _ in range(8)
++            ]
++
++            for future in limited + default:
++                future.result(timeout=10)
++
++        self.assertEqual(recorder.max_seen["limited"], 1)
++        self.assertGreaterEqual(recorder.max_seen["default"], 2)
++
++    def test_thread_pool_channel_fairness_no_starvation(self):
++        """A continuously submitting channel cannot starve another one."""
++        recorder = ConcurrencyRecorder()
++        stop_flood = threading.Event()
++        small_started = threading.Event()
++
++        def small_function():
++            small_started.set()
++
++            return "small"
++
++        with ThreadPool(
++            max_workers=3,
++            channels={
++                "big": ChannelConfig(max_concurrency=3, weight=1),
++                "small": ChannelConfig(max_concurrency=1, weight=1),
++            },
++        ) as pool:
++            flood_thread = threading.Thread(
++                target=flood, args=(pool, recorder, "big", stop_flood)
++            )
++            flood_thread.start()
++
++            time.sleep(0.2)  # let the big channel saturate the pool
++
++            small_future = pool.schedule(small_function, channel="small")
++
++            # The small channel starts within a bounded time even though
++            # the big channel keeps submitting tasks continuously.
++            self.assertTrue(small_started.wait(5))
++            self.assertEqual(small_future.result(timeout=10), "small")
++
++            stop_flood.set()
++            flood_thread.join()
++
++        self.assertIn("big", recorder.order)
++
++    def test_thread_pool_channel_weights(self):
++        """Weights define the dispatch order between ready channels."""
++        recorder = ConcurrencyRecorder()
++        gate = threading.Event()
++
++        with ThreadPool(
++            max_workers=1,
++            channels={
++                "a": ChannelConfig(weight=3),
++                "b": ChannelConfig(weight=1),
++            },
++        ) as pool:
++            futures = [
++                pool.schedule(
++                    recorder_function,
++                    args=(recorder, "a", gate, 0),
++                    channel="a",
++                )
++                for _ in range(8)
++            ]
++            futures += [
++                pool.schedule(
++                    recorder_function,
++                    args=(recorder, "b", gate, 0),
++                    channel="b",
++                )
++                for _ in range(8)
++            ]
++
++            time.sleep(0.2)  # let the scheduler order the whole backlog
++            gate.set()
++
++            for future in futures:
++                future.result(timeout=10)
++
++        self.assertEqual(
++            recorder.order,
++            ["a", "a", "a", "b", "a", "a", "a", "b", "a", "a",
++             "b", "b", "b", "b", "b", "b"],
++        )
++
++    def test_thread_pool_map_keeps_channel(self):
++        """All the map chunks inherit the channel of the map call."""
++        recorder = ConcurrencyRecorder()
++
++        with ThreadPool(
++            max_workers=4,
++            channels={"mapped": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            future = pool.map(
++                recorder_function,
++                [recorder] * 8,
++                ["mapped"] * 8,
++                chunksize=2,
++                channel="mapped",
++            )
++
++            self.assertEqual(list(future.result()), ["mapped"] * 8)
++
++        self.assertEqual(recorder.max_seen["mapped"], 1)
++
++    def test_thread_pool_channel_cancel(self):
++        """Cancelling a queued channel task frees its channel slot."""
++        with ThreadPool(
++            max_workers=1,
++            channels={"a": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            running = pool.schedule(long_function, channel="a")
++            queued = pool.schedule(long_function, channel="a")
++            time.sleep(0.1)
++
++            self.assertTrue(queued.cancel())
++
++            with self.assertRaises(CancelledError):
++                queued.result()
++
++            # The channel slot is released, the next task is admitted.
++            following = pool.schedule(function, args=[1], channel="a")
++            self.assertEqual(following.result(timeout=10), 1)
++            running.result(timeout=10)
++
++    def test_thread_pool_channel_decorator(self):
++        """The concurrent decorator routes tasks to the given channel."""
++        recorder = ConcurrencyRecorder()
++
++        with ThreadPool(
++            max_workers=4,
++            channels={"decorated": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++
++            @concurrent.thread(pool=pool, channel="decorated")
++            def decorated(recorder, channel):
++                return recorder.run(channel)
++
++            futures = [decorated(recorder, "decorated") for _ in range(6)]
++
++            for future in futures:
++                self.assertEqual(future.result(timeout=10), "decorated")
++
++        self.assertEqual(recorder.max_seen["decorated"], 1)
++
++    def test_thread_pool_channel_preserved_worker_recycle(self):
++        """Channel limits hold when workers are recycled via max_tasks."""
++        recorder = ConcurrencyRecorder()
++
++        with ThreadPool(
++            max_workers=2,
++            max_tasks=2,
++            channels={"a": ChannelConfig(max_concurrency=1)},
++        ) as pool:
++            futures = [
++                pool.schedule(
++                    recorder_function, args=(recorder, "a"), channel="a"
++                )
++                for _ in range(6)
++            ]
++
++            for future in futures:
++                future.result(timeout=10)
++
++        self.assertEqual(recorder.max_seen["a"], 1)

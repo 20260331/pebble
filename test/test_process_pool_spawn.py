@@ -17,6 +17,7 @@ from concurrent.futures import CancelledError, TimeoutError
 import pebble
 from pebble import ProcessPool, ProcessExpired
 from pebble.pool.base_pool import PoolStatus
+from pebble.pool.scheduler import ChannelConfig
 
 
 # set start method
@@ -111,6 +112,47 @@ def sigterm_function():
 
 def suicide_function():
     os._exit(1)
+
+
+class ProcessConcurrencyRecorder:
+    """Tracks per-channel concurrency from within worker processes."""
+
+    def __init__(self, manager):
+        self.lock = manager.Lock()
+        self.active = manager.dict()
+        self.max_seen = manager.dict()
+        self.order = manager.list()
+
+    def run(self, channel, gate=None, delay=0.02):
+        with self.lock:
+            current = self.active.get(channel, 0) + 1
+            self.active[channel] = current
+            self.max_seen[channel] = max(
+                self.max_seen.get(channel, 0), current
+            )
+            self.order.append(channel)
+
+        if gate is not None:
+            gate.wait(10)
+
+        time.sleep(delay)
+
+        with self.lock:
+            self.active[channel] = self.active[channel] - 1
+
+        return channel
+
+
+def process_recorder_function(recorder, channel, gate=None, delay=0.02):
+    return recorder.run(channel, gate, delay)
+
+
+def process_slow_label_function(label, delay=0.1):
+    time.sleep(delay)
+
+    return label
+
+
 
 
 def process_function():
@@ -930,3 +972,189 @@ class TestProcessPoolDeadlockOnCancelLargeData(unittest.TestCase):
             for f in futures:
                 f.cancel()
             pool.stop()
+
+
+@unittest.skipIf(not supported, "Start method is not supported")
+class TestProcessPoolChannels(unittest.TestCase):
+    def test_process_pool_channel_result(self):
+        """Process Pool tasks scheduled on a channel execute normally."""
+        with ProcessPool(
+            max_workers=2,
+            context=mp_context,
+            channels={"a": ChannelConfig(max_concurrency=1)},
+        ) as pool:
+            future = pool.schedule(
+                function,
+                args=[1],
+                kwargs={"keyword_argument": 1},
+                channel="a",
+            )
+
+        self.assertEqual(future.result(), 2)
+
+    def test_process_pool_unknown_channel(self):
+        """Scheduling on an undeclared channel raises ValueError."""
+        with ProcessPool(
+            context=mp_context,
+            channels={"a": ChannelConfig()},
+        ) as pool:
+            with self.assertRaises(ValueError):
+                pool.schedule(function, channel="b")
+
+    def test_process_pool_channel_concurrency_limit(self):
+        """The channel concurrency limit is never exceeded."""
+        with multiprocessing.Manager() as manager:
+            recorder = ProcessConcurrencyRecorder(manager)
+
+            with ProcessPool(
+                max_workers=4,
+                context=mp_context,
+                channels={"limited": ChannelConfig(max_concurrency=1)},
+            ) as pool:
+                limited = [
+                    pool.schedule(
+                        process_recorder_function,
+                        args=(recorder, "limited"),
+                        channel="limited",
+                    )
+                    for _ in range(4)
+                ]
+                default = [
+                    pool.schedule(
+                        process_recorder_function,
+                        args=(recorder, "default"),
+                    )
+                    for _ in range(4)
+                ]
+
+                for future in limited + default:
+                    future.result(timeout=30)
+
+            self.assertEqual(recorder.max_seen["limited"], 1)
+            self.assertGreaterEqual(recorder.max_seen["default"], 2)
+
+    def test_process_pool_channel_fairness_no_starvation(self):
+        """A large backlog cannot starve a task of another channel."""
+        completion_order = []
+
+        def record(label):
+            def callback(_):
+                completion_order.append(label)
+
+            return callback
+
+        with ProcessPool(
+            max_workers=3,
+            context=mp_context,
+            channels={
+                "big": ChannelConfig(max_concurrency=3, weight=1),
+                "small": ChannelConfig(max_concurrency=1, weight=1),
+            },
+        ) as pool:
+            big_futures = [
+                pool.schedule(
+                    process_slow_label_function,
+                    args=("big",),
+                    channel="big",
+                )
+                for _ in range(12)
+            ]
+            small_future = pool.schedule(
+                process_slow_label_function,
+                args=("small",),
+                channel="small",
+            )
+
+            for future in big_futures:
+                future.add_done_callback(record("big"))
+            small_future.add_done_callback(record("small"))
+
+            self.assertEqual(small_future.result(timeout=30), "small")
+            for future in big_futures:
+                future.result(timeout=30)
+
+        # The small channel is served within the first rounds instead
+        # of waiting for the whole big backlog to be processed.
+        self.assertLessEqual(completion_order.index("small"), 6)
+
+    def test_process_pool_map_keeps_channel(self):
+        """All the map chunks inherit the channel of the map call."""
+        with multiprocessing.Manager() as manager:
+            recorder = ProcessConcurrencyRecorder(manager)
+
+            with ProcessPool(
+                max_workers=4,
+                context=mp_context,
+                channels={"mapped": ChannelConfig(max_concurrency=1)},
+            ) as pool:
+                future = pool.map(
+                    process_recorder_function,
+                    [recorder] * 6,
+                    ["mapped"] * 6,
+                    chunksize=2,
+                    channel="mapped",
+                )
+
+                self.assertEqual(list(future.result()), ["mapped"] * 6)
+
+            self.assertEqual(recorder.max_seen["mapped"], 1)
+
+    def test_process_pool_channel_cancel(self):
+        """Cancelling a queued channel task frees its channel slot."""
+        with ProcessPool(
+            max_workers=1,
+            context=mp_context,
+            channels={"a": ChannelConfig(max_concurrency=1)},
+        ) as pool:
+            running = pool.schedule(long_function, channel="a")
+            queued = pool.schedule(long_function, channel="a")
+            time.sleep(0.3)
+
+            self.assertTrue(queued.cancel())
+
+            with self.assertRaises(CancelledError):
+                queued.result()
+
+            following = pool.schedule(function, args=[1], channel="a")
+            self.assertEqual(following.result(timeout=30), 1)
+            running.result(timeout=30)
+
+    def test_process_pool_channel_worker_restart(self):
+        """Pending tasks keep their channel across worker restarts."""
+        with multiprocessing.Manager() as manager:
+            recorder = ProcessConcurrencyRecorder(manager)
+
+            with ProcessPool(
+                max_workers=2,
+                context=mp_context,
+                channels={
+                    "a": ChannelConfig(max_concurrency=1),
+                    "b": ChannelConfig(max_concurrency=2),
+                },
+            ) as pool:
+                dying = pool.schedule(suicide_function, channel="a")
+                a_futures = [
+                    pool.schedule(
+                        process_recorder_function,
+                        args=(recorder, "a"),
+                        channel="a",
+                    )
+                    for _ in range(4)
+                ]
+                b_futures = [
+                    pool.schedule(
+                        process_recorder_function,
+                        args=(recorder, "b"),
+                        channel="b",
+                    )
+                    for _ in range(3)
+                ]
+
+                with self.assertRaises(ProcessExpired):
+                    dying.result(timeout=30)
+
+                for future in a_futures + b_futures:
+                    future.result(timeout=30)
+
+            self.assertEqual(recorder.max_seen["a"], 1)
+            self.assertLessEqual(recorder.max_seen["b"], 2)

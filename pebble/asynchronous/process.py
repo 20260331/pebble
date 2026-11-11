@@ -41,6 +41,7 @@ def process(
     timeout: float | None = None,
     mp_context: MultiprocessingContext | None = None,
     pool: ProcessPool | None = None,
+    channel: str | None = None,
 ) -> Callable[[Callable[P, T]], Callable[P, asyncio.Future[T]]]: ...
 def process(*args, **kwargs):
     """Runs the decorated function in a concurrent process,
@@ -64,6 +65,9 @@ def process(*args, **kwargs):
     The pool parameter accepts a pebble.ProcessPool instance to be used
     instead of running the function in a new process.
 
+    The channel parameter routes the task to a named workload channel
+    of the provided pool, it is ignored if pool is not set.
+
     """
     return common.decorate_function(_process_wrapper, *args, **kwargs)
 
@@ -75,6 +79,7 @@ def _process_wrapper(
     timeout: float,
     mp_context: MultiprocessingContext,
     pool: ProcessPool | None,
+    channel: str | None,
 ) -> Callable:
     if isinstance(function, FunctionType):
         common.register_function(function)
@@ -95,12 +100,24 @@ def _process_wrapper(
         target, args = common.maybe_install_trampoline(function, args, start_method)
 
         if pool is not None:
-            future = loop.run_in_executor(
-                pool,  # type: ignore[arg-type] - Executor compatible API
-                target,
-                timeout,
-                *args,
-            )
+            if channel is not None:
+                # run_in_executor cannot carry the channel, schedule
+                # directly and bridge the resulting Future to asyncio.
+                pebble_future = pool.schedule(
+                    target,
+                    args=args,
+                    kwargs=kwargs,
+                    timeout=timeout,
+                    channel=channel,
+                )
+                future = asyncio.wrap_future(pebble_future)
+            else:
+                future = loop.run_in_executor(
+                    pool,  # type: ignore[arg-type] - Executor compatible API
+                    target,
+                    timeout,
+                    *args,
+                )
         else:
             future: asyncio.Future = loop.create_future()
             reader, writer = mp_context.Pipe(duplex=False)

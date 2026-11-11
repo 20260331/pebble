@@ -63,30 +63,38 @@ def decorate_function(wrapper: Callable, *args, **kwargs) -> Callable:
     daemon = kwargs.get("daemon", True)
     timeout = kwargs.get("timeout")
     mp_context = kwargs.get("context")
+    channel = kwargs.get("channel")
 
     # decorator without parameters: @process/process(function)
     if not kwargs and len(args) == 1 and callable(args[0]):
-        return wrapper(args[0], name, daemon, timeout, multiprocessing, pool)
+        return wrapper(args[0], name, daemon, timeout, multiprocessing, pool, channel)
 
     # decorator with parameters
-    _validate_parameters(name, daemon, timeout)
+    _validate_parameters(name, daemon, timeout, channel)
     mp_context = mp_context if mp_context is not None else multiprocessing
 
     ## without @pie syntax: process(function, timeout=12)
     if len(args) == 1 and callable(args[0]):
-        return wrapper(args[0], name, daemon, timeout, multiprocessing, pool)
+        return wrapper(args[0], name, daemon, timeout, multiprocessing, pool, channel)
 
     ## with @pie syntax: @process(timeout=12)
     def decorating_function(function: Callable) -> Callable:
-        return wrapper(function, name, daemon, timeout, mp_context, pool)
+        return wrapper(function, name, daemon, timeout, mp_context, pool, channel)
 
     return decorating_function
 
 
-def _validate_parameters(name: str | None, daemon: bool, timeout: float | None):
+def _validate_parameters(
+    name: str | None,
+    daemon: bool,
+    timeout: float | None,
+    channel: str | None,
+):
     if name is not None and not isinstance(name, str):
         raise TypeError("Name expected to be None or string")
     if daemon is not None and not isinstance(daemon, bool):
         raise TypeError("Daemon expected to be None or bool")
     if timeout is not None and not isinstance(timeout, (int, float)):
         raise TypeError("Timeout expected to be None or integer or float")
+    if channel is not None and not isinstance(channel, str):
+        raise TypeError("Channel expected to be None or string")

@@ -30,6 +30,7 @@ from typing import Any, Callable, Generic, Iterable
 
 from pebble.common.types import T
 from pebble.common import Result, ResultStatus, ProcessFuture, CONSTS
+from pebble.pool.scheduler import ChannelConfig, FairScheduler
 
 
 class BasePool:
@@ -39,9 +40,10 @@ class BasePool:
         max_tasks: int,
         initializer: Callable | None,
         initargs: Iterable[Any],
+        channels: Mapping[str, ChannelConfig] | None = None,
     ):
         self._context: PoolContext = PoolContext(
-            max_workers, max_tasks, initializer, initargs
+            max_workers, max_tasks, initializer, initargs, channels
         )
         self._loops: Iterable[Any] = ()
         self._task_counter: itertools.count = itertools.count()
@@ -127,14 +129,17 @@ class PoolContext:
         max_tasks: int,
         initializer: Callable | None,
         initargs: Iterable[Any],
+        channels: Mapping[str, ChannelConfig] | None = None,
     ):
         self._status: PoolStatus = PoolStatus.CREATED
         self.status_mutex: RLock = RLock()
 
         self.task_queue: Queue[Task | None] = Queue()
+        self.dispatch_queue: Queue[Task | None] = Queue()
         self.workers: int = max_workers
         self.task_counter: itertools.count = itertools.count()
         self.worker_parameters: Worker = Worker(max_tasks, initializer, initargs)
+        self.scheduler: FairScheduler = FairScheduler(channels)
 
     @property
     def status(self) -> PoolStatus:
@@ -158,11 +163,13 @@ class Task:
         future: Future,
         timeout: float | None,
         payload: TaskPayload,
+        channel: str | None = None,
     ):
         self.id: int = identifier
         self.future: Future = future
         self.timeout: float | None = timeout
         self.payload: TaskPayload = payload
+        self.channel: str | None = channel
         self.timestamp: float = 0.0
         self.worker_id: int = 0
 

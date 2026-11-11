@@ -40,6 +40,7 @@ def process(
     timeout: float | None = None,
     mp_context: MultiprocessingContext | None = None,
     pool: ProcessPool | None = None,
+    channel: str | None = None,
 ) -> Callable[[Callable[P, T]], Callable[P, common.ProcessFuture[T]]]: ...
 def process(*args, **kwargs):
     """Runs the decorated function in a concurrent process,
@@ -63,6 +64,9 @@ def process(*args, **kwargs):
     The pool parameter accepts a pebble.ProcessPool instance to be used
     instead of running the function in a new process.
 
+    The channel parameter routes the task to a named workload channel
+    of the provided pool, it is ignored if pool is not set.
+
     """
     return common.decorate_function(_process_wrapper, *args, **kwargs)
 
@@ -74,6 +78,7 @@ def _process_wrapper(
     timeout: float,
     mp_context: MultiprocessingContext,
     pool: ProcessPool | None,
+    channel: str | None,
 ) -> Callable:
     if isinstance(function, FunctionType):
         common.register_function(function)
@@ -94,7 +99,11 @@ def _process_wrapper(
 
         if pool is not None:
             future: common.ProcessFuture = pool.schedule(
-                target, args=args, kwargs=kwargs, timeout=timeout
+                target,
+                args=args,
+                kwargs=kwargs,
+                timeout=timeout,
+                channel=channel,
             )
         else:
             future: common.ProcessFuture = common.ProcessFuture()

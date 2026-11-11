@@ -29,7 +29,10 @@ from pebble.pool.thread import ThreadPool
 def thread(func: Callable[P, T]) -> Callable[P, Future[T]]: ...
 @overload
 def thread(
-    name: str | None = None, daemon: bool = True, pool: ThreadPool | None = None
+    name: str | None = None,
+    daemon: bool = True,
+    pool: ThreadPool | None = None,
+    channel: str | None = None,
 ) -> Callable[[Callable[P, T]], Callable[P, Future[T]]]: ...
 def thread(*args, **kwargs):
     """Runs the decorated function within a concurrent thread,
@@ -46,6 +49,9 @@ def thread(*args, **kwargs):
     The pool parameter accepts a pebble.ThreadPool instance to be used
     instead of running the function in a new process.
 
+    The channel parameter routes the task to a named workload channel
+    of the provided pool, it is ignored if pool is not set.
+
     """
     return common.decorate_function(_thread_wrapper, *args, **kwargs)
 
@@ -57,6 +63,7 @@ def _thread_wrapper(
     _timeout: float,
     _mp_context,
     pool: ThreadPool,
+    channel: str | None,
 ) -> Callable:
     if pool is not None:
         if not isinstance(pool, ThreadPool):
@@ -65,7 +72,9 @@ def _thread_wrapper(
     @wraps(function)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> Future[T]:
         if pool is not None:
-            future: Future = pool.schedule(function, args=args, kwargs=kwargs)
+            future: Future = pool.schedule(
+                function, args=args, kwargs=kwargs, channel=channel
+            )
         else:
             future = Future()
 

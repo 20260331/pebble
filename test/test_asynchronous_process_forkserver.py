@@ -10,6 +10,7 @@ import multiprocessing
 from concurrent.futures import CancelledError, TimeoutError
 
 from pebble import asynchronous, ProcessExpired, ProcessPool
+from pebble.pool.scheduler import ChannelConfig
 
 
 # set start method
@@ -420,3 +421,19 @@ class TestProcessAsynchronous(unittest.TestCase):
             return await pool_decorated(1, 1)
 
         self.assertEqual(asyncio.run(test()), asyncio.run(test()))
+
+    def test_pool_channel_decorated(self):
+        """Pool asynchronous decorator honors the channel parameter."""
+        async def scenario():
+            with ProcessPool(
+                max_workers=2,
+                context=mp_context,
+                channels={"a": ChannelConfig(max_concurrency=1)},
+            ) as pool:
+                channel_decorated = asynchronous.process(
+                    not_decorated, pool=pool, channel="a"
+                )
+
+                return await channel_decorated(1, 1)
+
+        self.assertEqual(asyncio.run(scenario()), 2)

@@ -19,7 +19,7 @@ from __future__ import annotations
 import time
 import multiprocessing
 
-from queue import Queue
+from queue import Queue, Empty
 from itertools import count
 from threading import Thread
 from concurrent.futures import Future
@@ -31,6 +31,7 @@ from pebble.pool.base_pool import iter_chunks, run_initializer
 from pebble.pool.base_pool import MapResults, Worker, Result
 from pebble.pool.base_pool import PoolStatus, MapFuture, map_results
 from pebble.pool.base_pool import PoolContext, BasePool, Task, TaskPayload
+from pebble.pool.scheduler import ChannelConfig
 
 
 class ThreadPool(BasePool):
@@ -52,19 +53,27 @@ class ThreadPool(BasePool):
         max_tasks: int = 0,
         initializer: Callable | None = None,
         initargs: Iterable[Any] = (),
+        channels: Mapping[str, ChannelConfig] | None = None,
     ):
-        super().__init__(max_workers, max_tasks, initializer, initargs)
+        super().__init__(max_workers, max_tasks, initializer, initargs, channels)
         self._pool_manager: PoolManager = PoolManager(self._context)
+        self._task_scheduler_loop: Thread | None = None
         self._pool_manager_loop: Thread | None = None
 
     def _start_pool(self):
         with self._context.status_mutex:
             if self._context.status == PoolStatus.CREATED:
                 self._pool_manager.start()
+                self._task_scheduler_loop = launch_thread(
+                    None, task_scheduler_loop, True, self._pool_manager
+                )
                 self._pool_manager_loop = launch_thread(
                     None, pool_manager_loop, True, self._pool_manager
                 )
-                self._loops = (self._pool_manager_loop,)
+                self._loops = (
+                    self._task_scheduler_loop,
+                    self._pool_manager_loop,
+                )
 
                 self._context.status = PoolStatus.RUNNING
 
@@ -72,26 +81,33 @@ class ThreadPool(BasePool):
         if self._pool_manager_loop is not None:
             self._pool_manager_loop.join()
         self._pool_manager.stop()
+        if self._task_scheduler_loop is not None:
+            self._task_scheduler_loop.join()
 
     def schedule(
         self,
         function: Callable[..., T],
         args: Iterable[Any] = (),
         kwargs: Mapping[str, Any] = {},
+        channel: str | None = None,
     ) -> Future[T]:
         """Schedules *function* to be run the Pool.
 
         *args* and *kwargs* will be forwareded to the scheduled function
         respectively as arguments and keyword arguments.
 
+        *channel* optionally routes the task to a named workload channel
+        configured at Pool construction.
+
         A *concurrent.futures.Future* object is returned.
 
         """
         self._check_pool_status()
+        self._context.scheduler.validate(channel)
 
         future: Future = Future()
         payload: TaskPayload = TaskPayload(function, args, kwargs)
-        task: Task = Task(next(self._task_counter), future, None, payload)
+        task: Task = Task(next(self._task_counter), future, None, payload, channel)
 
         self._context.task_queue.put(task)
 
@@ -113,13 +129,17 @@ class ThreadPool(BasePool):
         function: Callable[..., T],
         *iterables: Iterable[Any],
         timeout: float | None = None,
-        chunksize: int = 1
+        chunksize: int = 1,
+        channel: str | None = None,
     ) -> MapFuture[MapResults[T]]:
         """Returns an iterator equivalent to map(function, iterables).
 
         *chunksize* controls the size of the chunks the iterable will
         be broken into before being passed to the function. If None
         the size will be controlled by the Pool.
+
+        *channel* optionally routes all the chunks to a named workload
+        channel configured at Pool construction.
 
         """
         self._check_pool_status()
@@ -128,12 +148,58 @@ class ThreadPool(BasePool):
             raise ValueError("chunksize must be >= 1")
 
         futures: List[Future] = [
-            self.schedule(process_chunk, args=(function, chunk))
+            self.schedule(process_chunk, args=(function, chunk), channel=channel)
             for chunk in iter_chunks(zip(*iterables), chunksize)
         ]
         future: MapFuture = MapFuture(futures)
 
         return map_results(future, timeout)
+
+
+def task_scheduler_loop(pool_manager: PoolManager):
+    """Moves tasks from the submission queue to the workers dispatch queue.
+
+    Tasks are routed through the FairScheduler which enforces the
+    per-channel concurrency limits and prevents any busy channel from
+    starving the other ready ones.
+
+    """
+    context: PoolContext = pool_manager.context
+    scheduler = context.scheduler
+
+    while True:
+        while True:
+            try:
+                task: Task | None = context.task_queue.get_nowait()
+            except Empty:
+                break
+
+            if task is None:  # Pool termination sentinel
+                context.task_queue.task_done()
+
+                return
+            elif task.future.cancelled():
+                task.set_running_or_notify_cancel()
+                context.task_queue.task_done()
+            else:
+                scheduler.admit(task)
+
+        if not context.alive:
+            return
+
+        while context.alive:
+            task = scheduler.retrieve()
+
+            if task is None:
+                break
+            elif task.future.cancelled():
+                task.set_running_or_notify_cancel()
+                scheduler.release(task)
+                context.task_queue.task_done()
+            else:
+                context.dispatch_queue.put(task)
+
+        scheduler.wait(CONSTS.sleep_unit)
 
 
 def pool_manager_loop(pool_manager: PoolManager):
@@ -153,8 +219,8 @@ class PoolManager:
         self.create_workers()
 
     def stop(self):
-        for worker in self.workers:
-            self.context.task_queue.put(None)
+        for _ in self.workers:
+            self.context.dispatch_queue.put(None)
         for worker in tuple(self.workers):
             self.join_worker(worker)
 
@@ -182,7 +248,6 @@ class PoolManager:
 
 def worker_thread(context: PoolContext):
     """The worker thread routines."""
-    queue: Queue[Task | None] = context.task_queue
     parameters: Worker = context.worker_parameters
 
     if parameters.initializer is not None:
@@ -192,12 +257,13 @@ def worker_thread(context: PoolContext):
 
     for task in get_next_task(context, parameters.max_tasks):
         execute_next_task(task)
-        queue.task_done()
+        context.scheduler.release(task)
+        context.task_queue.task_done()
 
 
 def get_next_task(context: PoolContext, max_tasks: int):
     counter: count = count()
-    queue: Queue[Task | None] = context.task_queue
+    queue: Queue[Task | None] = context.dispatch_queue
 
     while context.alive and (max_tasks == 0 or next(counter) < max_tasks):
         task: Task | None = queue.get()
@@ -205,7 +271,8 @@ def get_next_task(context: PoolContext, max_tasks: int):
         if task is not None:
             if task.future.cancelled():
                 task.set_running_or_notify_cancel()
-                queue.task_done()
+                context.scheduler.release(task)
+                context.task_queue.task_done()
             else:
                 yield task
 

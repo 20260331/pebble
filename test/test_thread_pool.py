@@ -7,8 +7,9 @@ import dataclasses
 from unittest import mock
 from concurrent.futures import CancelledError, TimeoutError
 
-from pebble import ThreadPool
+from pebble import ThreadPool, concurrent
 from pebble.pool.base_pool import PoolStatus
+from pebble.pool.scheduler import ChannelConfig
 
 initarg = 0
 
@@ -61,6 +62,42 @@ def tid_function():
 def dead_manager_loop(*args, **kwargs):
     """Stand-in for pool_manager_loop that crashes."""
     time.sleep(0.1)
+
+
+class ConcurrencyRecorder:
+    """Tracks the maximum amount of concurrent tasks per channel."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = {}
+        self.max_seen = {}
+        self.order = []
+
+    def run(self, channel, gate=None, delay=0.001):
+        with self.lock:
+            current = self.active.get(channel, 0) + 1
+            self.active[channel] = current
+            self.max_seen[channel] = max(self.max_seen.get(channel, 0), current)
+            self.order.append(channel)
+
+        if gate is not None:
+            gate.wait(5)
+
+        time.sleep(delay)
+
+        with self.lock:
+            self.active[channel] -= 1
+
+        return channel
+
+
+def recorder_function(recorder, channel, gate=None, delay=0.001):
+    return recorder.run(channel, gate, delay)
+
+
+def flood(pool, recorder, channel, stop_event):
+    while not stop_event.is_set():
+        pool.schedule(recorder_function, args=(recorder, channel), channel=channel)
 
 
 class TestThreadPool(unittest.TestCase):
@@ -502,3 +539,209 @@ class TestAsyncIOThreadPool(unittest.TestCase):
         with ThreadPool(max_workers=1) as pool:
             asyncio.run(test(pool))
             self.assertTrue(isinstance(self.exception, asyncio.CancelledError))
+
+
+class TestThreadPoolChannels(unittest.TestCase):
+    def test_thread_pool_channel_result(self):
+        """Tasks scheduled on a channel are executed normally."""
+        with ThreadPool(
+            max_workers=2,
+            channels={"a": ChannelConfig(max_concurrency=1)},
+        ) as pool:
+            future = pool.schedule(
+                function, args=[1], kwargs={"keyword_argument": 1},
+                channel="a",
+            )
+
+        self.assertEqual(future.result(), 2)
+
+    def test_thread_pool_unknown_channel(self):
+        """Scheduling on an undeclared channel raises ValueError."""
+        with ThreadPool(channels={"a": ChannelConfig()}) as pool:
+            with self.assertRaises(ValueError):
+                pool.schedule(function, channel="b")
+
+    def test_thread_pool_channel_concurrency_limit(self):
+        """The channel concurrency limit is never exceeded."""
+        recorder = ConcurrencyRecorder()
+
+        with ThreadPool(
+            max_workers=4,
+            channels={"limited": ChannelConfig(max_concurrency=1)},
+        ) as pool:
+            limited = [
+                pool.schedule(
+                    recorder_function, args=(recorder, "limited"),
+                    channel="limited",
+                )
+                for _ in range(8)
+            ]
+            default = [
+                pool.schedule(recorder_function, args=(recorder, "default"))
+                for _ in range(8)
+            ]
+
+            for future in limited + default:
+                future.result(timeout=10)
+
+        self.assertEqual(recorder.max_seen["limited"], 1)
+        self.assertGreaterEqual(recorder.max_seen["default"], 2)
+
+    def test_thread_pool_channel_fairness_no_starvation(self):
+        """A continuously submitting channel cannot starve another one."""
+        recorder = ConcurrencyRecorder()
+        stop_flood = threading.Event()
+        small_started = threading.Event()
+
+        def small_function():
+            small_started.set()
+
+            return "small"
+
+        with ThreadPool(
+            max_workers=3,
+            channels={
+                "big": ChannelConfig(max_concurrency=3, weight=1),
+                "small": ChannelConfig(max_concurrency=1, weight=1),
+            },
+        ) as pool:
+            flood_thread = threading.Thread(
+                target=flood, args=(pool, recorder, "big", stop_flood)
+            )
+            flood_thread.start()
+
+            time.sleep(0.2)  # let the big channel saturate the pool
+
+            small_future = pool.schedule(small_function, channel="small")
+
+            # The small channel starts within a bounded time even though
+            # the big channel keeps submitting tasks continuously.
+            self.assertTrue(small_started.wait(5))
+            self.assertEqual(small_future.result(timeout=10), "small")
+
+            stop_flood.set()
+            flood_thread.join()
+
+        self.assertIn("big", recorder.order)
+
+    def test_thread_pool_channel_weights(self):
+        """Weights define the dispatch order between ready channels."""
+        recorder = ConcurrencyRecorder()
+        gate = threading.Event()
+
+        with ThreadPool(
+            max_workers=1,
+            channels={
+                "a": ChannelConfig(weight=3),
+                "b": ChannelConfig(weight=1),
+            },
+        ) as pool:
+            futures = [
+                pool.schedule(
+                    recorder_function,
+                    args=(recorder, "a", gate, 0),
+                    channel="a",
+                )
+                for _ in range(8)
+            ]
+            futures += [
+                pool.schedule(
+                    recorder_function,
+                    args=(recorder, "b", gate, 0),
+                    channel="b",
+                )
+                for _ in range(8)
+            ]
+
+            time.sleep(0.2)  # let the scheduler order the whole backlog
+            gate.set()
+
+            for future in futures:
+                future.result(timeout=10)
+
+        self.assertEqual(
+            recorder.order,
+            ["a", "a", "a", "b", "a", "a", "a", "b", "a", "a",
+             "b", "b", "b", "b", "b", "b"],
+        )
+
+    def test_thread_pool_map_keeps_channel(self):
+        """All the map chunks inherit the channel of the map call."""
+        recorder = ConcurrencyRecorder()
+
+        with ThreadPool(
+            max_workers=4,
+            channels={"mapped": ChannelConfig(max_concurrency=1)},
+        ) as pool:
+            future = pool.map(
+                recorder_function,
+                [recorder] * 8,
+                ["mapped"] * 8,
+                chunksize=2,
+                channel="mapped",
+            )
+
+            self.assertEqual(list(future.result()), ["mapped"] * 8)
+
+        self.assertEqual(recorder.max_seen["mapped"], 1)
+
+    def test_thread_pool_channel_cancel(self):
+        """Cancelling a queued channel task frees its channel slot."""
+        with ThreadPool(
+            max_workers=1,
+            channels={"a": ChannelConfig(max_concurrency=1)},
+        ) as pool:
+            running = pool.schedule(long_function, channel="a")
+            queued = pool.schedule(long_function, channel="a")
+            time.sleep(0.1)
+
+            self.assertTrue(queued.cancel())
+
+            with self.assertRaises(CancelledError):
+                queued.result()
+
+            # The channel slot is released, the next task is admitted.
+            following = pool.schedule(function, args=[1], channel="a")
+            self.assertEqual(following.result(timeout=10), 1)
+            running.result(timeout=10)
+
+    def test_thread_pool_channel_decorator(self):
+        """The concurrent decorator routes tasks to the given channel."""
+        recorder = ConcurrencyRecorder()
+
+        with ThreadPool(
+            max_workers=4,
+            channels={"decorated": ChannelConfig(max_concurrency=1)},
+        ) as pool:
+
+            @concurrent.thread(pool=pool, channel="decorated")
+            def decorated(recorder, channel):
+                return recorder.run(channel)
+
+            futures = [decorated(recorder, "decorated") for _ in range(6)]
+
+            for future in futures:
+                self.assertEqual(future.result(timeout=10), "decorated")
+
+        self.assertEqual(recorder.max_seen["decorated"], 1)
+
+    def test_thread_pool_channel_preserved_worker_recycle(self):
+        """Channel limits hold when workers are recycled via max_tasks."""
+        recorder = ConcurrencyRecorder()
+
+        with ThreadPool(
+            max_workers=2,
+            max_tasks=2,
+            channels={"a": ChannelConfig(max_concurrency=1)},
+        ) as pool:
+            futures = [
+                pool.schedule(
+                    recorder_function, args=(recorder, "a"), channel="a"
+                )
+                for _ in range(6)
+            ]
+
+            for future in futures:
+                future.result(timeout=10)
+
+        self.assertEqual(recorder.max_seen["a"], 1)

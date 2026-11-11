@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Pebble q2 命名工作负载公平调度验证</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #10151c; color: #e8edf2; }
+    main { width: 1240px; margin: 0 auto; padding: 40px 52px 56px; }
+    h1 { margin: 0 0 8px; font-size: 30px; letter-spacing: .2px; }
+    h2 { margin: 30px 0 12px; font-size: 19px; color: #9fd5ff; }
+    p { margin: 8px 0; font-size: 14px; line-height: 1.55; }
+    .meta { color: #aab6c2; margin-bottom: 22px; }
+    .status { border-left: 5px solid #54d892; background: #172720; padding: 15px 19px; }
+    .status strong { color: #72e6a5; }
+    table { width: 100%; border-collapse: collapse; background: #171e27; }
+    th, td { text-align: left; vertical-align: top; padding: 10px 13px; border-bottom: 1px solid #2c3742; font-size: 13.5px; line-height: 1.45; }
+    th { color: #b9c6d3; background: #202a35; }
+    .pass { color: #72e6a5; font-weight: 700; white-space: nowrap; }
+    .warn { color: #f2c66d; }
+    code { color: #d3e9ff; background: #222d38; padding: 2px 5px; border-radius: 3px; font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; }
+    pre { white-space: pre-wrap; background: #0b1015; border: 1px solid #2b3743; padding: 15px; line-height: 1.5; font-size: 13px; font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; }
+    .small { color: #aab6c2; font-size: 12.5px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Pebble q2：命名工作负载的加权公平调度</h1>
+  <p class="meta">Base <code>acb9b7ab8aec5b68723fd51de330dce6a225e0be</code> · Branch <code>swe/q2-named-workload-fair-scheduling</code> · Effective turns 157</p>
+
+  <div class="status">
+    <strong>是否完成需求：完成</strong><br>
+    可选命名通道、并发上限、加权公平轮转、map 分块、装饰器、取消/超时/worker 替换归属均已在当前工作树验证；全量测试无回归。
+  </div>
+
+  <h2>验证命令与结果</h2>
+  <table>
+    <tr><th>命令</th><th>结果</th><th>说明</th></tr>
+    <tr><td><code>python3 -m pytest -q test/test_pool_scheduler.py</code></td><td class="pass">9 passed</td><td>调度器单元测试。</td></tr>
+    <tr><td><code>python3 -m pytest -q test/test_thread_pool.py test/test_process_pool_fork.py test/test_process_pool_forkserver.py test/test_process_pool_spawn.py</code></td><td class="pass">274 passed</td><td>线程池、进程池及新增通道场景。</td></tr>
+    <tr><td><code>python3 -m pytest -q</code></td><td class="pass">471 passed</td><td>完整回归，用时 171.04s；252 条 warning 均为既有 multiprocessing/fork 或插件提示。</td></tr>
+    <tr><td><code>python3 -m pyright pebble/</code></td><td class="pass">0 errors</td><td>类型检查通过。</td></tr>
+    <tr><td><code>python3 -m ruff format --check &lt;changed python files&gt;</code></td><td class="pass">11 files formatted</td><td>变更源码均符合仓库格式化要求。</td></tr>
+  </table>
+
+  <h2>固定 Verify Rubric 与产物结果</h2>
+  <table>
+    <tr><th>ID</th><th>结果</th><th>依据</th></tr>
+    <tr><td>1</td><td class="pass">通过</td><td>不配置通道的默认路径沿用原任务队列语义；完整回归 471 passed。</td></tr>
+    <tr><td>2</td><td class="pass">通过</td><td>ThreadPool、ProcessPool 的 schedule/map 及 concurrent/asynchronous 装饰器均接受通道；未指定通道进入默认通道。</td></tr>
+    <tr><td>3</td><td class="pass">通过</td><td>非法权重、非正并发上限在 pool 构造时拒绝，未知通道在 schedule 提交前抛出 ValueError。</td></tr>
+    <tr><td>4</td><td class="pass">通过</td><td>线程与进程测试记录到通道 max_seen 不超过配置值；整池仍由 worker 数量约束。</td></tr>
+    <tr><td>5</td><td class="pass">通过</td><td>等权积压探针中 small 通道在 1 个 big 任务后启动；weight=10 探针在 10 个 big 任务后启动，未发生无限饥饿。</td></tr>
+    <tr><td>6</td><td class="pass">通过</td><td>同通道使用 FIFO 队列；map 分块与最坏完成顺序不会改变 MapFuture 的对外结果顺序。</td></tr>
+    <tr><td>7</td><td class="pass">通过</td><td>取消、超时、worker 非正常退出和关闭场景通过；超时后下一任务可运行，worker 替换后待运行任务保持原通道并完成。</td></tr>
+    <tr><td>8</td><td class="pass">通过</td><td>线程池与进程池共用同一 FairScheduler 策略，并分别通过对应实现测试。</td></tr>
+  </table>
+
+  <h2>独立边界探针</h2>
+  <pre>equally_weighted_backlog: small started after 1 big task
+weight_10_backlog:        small started after 10 big tasks
+timeout_released_channel: True
+restart_preserved_a:      True
+restart_preserved_b:      True</pre>
+  <p class="small">截图生成方式：将本验证报告保存为本地 HTML，使用 google-chrome --headless=new --no-sandbox --hide-scrollbars --window-size=1440,1800 --screenshot=evidence/screenshots/q2-verification.png file:///绝对路径/evidence/q2-verification.html。</p>
+</main>
+</body>
+</html>

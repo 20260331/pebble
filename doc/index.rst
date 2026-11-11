@@ -19,7 +19,7 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
 `Concurrent Module`
 -------------------
 
-.. decorator:: concurrent.process(timeout=None, name=None, daemon=True, context=None, pool=None)
+.. decorator:: concurrent.process(timeout=None, name=None, daemon=True, context=None, pool=None, channel=None)
 
    Runs the decorated function in a concurrent process, taking care of the results and error management.
 
@@ -35,7 +35,9 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
 
    The *pool* parameter accepts a pebble.ProcessPool_ object. If provided, the pool will be used to run the function instead of a dedicated process. The *name*, *daemon* and *context* parameters will be ignored.
 
-.. decorator:: concurrent.thread(name=None, daemon=True, pool=None)
+   The *channel* parameter routes the decorated function to a named workload channel of the provided *pool*. It is ignored if *pool* is not set.
+
+.. decorator:: concurrent.thread(name=None, daemon=True, pool=None, channel=None)
 
    Runs the decorated function in a concurrent thread, taking care of the results and error management.
 
@@ -47,10 +49,12 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
 
    The *pool* parameter accepts a pebble.ThreadPool_ object. If provided, the pool will be used to run the function instead of a dedicated thread. The *name* and *daemon* parameters will be ignored.
 
+   The *channel* parameter routes the decorated function to a named workload channel of the provided *pool*. It is ignored if *pool* is not set.
+
 `Asynchronous Module`
 ---------------------
 
-.. decorator:: asynchronous.process(timeout=None, name=None, daemon=True, context=None, pool=None)
+.. decorator:: asynchronous.process(timeout=None, name=None, daemon=True, context=None, pool=None, channel=None)
 
    Runs the decorated function in a concurrent process, taking care of the results and error management.
 
@@ -66,7 +70,9 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
 
    The *pool* parameter accepts a pebble.ProcessPool_ object. If provided, the pool will be used to run the function instead of a dedicated process. The *name*, *daemon* and *context* parameters will be ignored.
 
-.. decorator:: asynchronous.thread(name=None, daemon=True, pool=None)
+   The *channel* parameter routes the decorated function to a named workload channel of the provided *pool*. It is ignored if *pool* is not set.
+
+.. decorator:: asynchronous.thread(name=None, daemon=True, pool=None, channel=None)
 
    Runs the decorated function in a concurrent thread, taking care of the results and error management.
 
@@ -78,12 +84,23 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
 
    The *pool* parameter accepts a pebble.ThreadPool_ object. If provided, the pool will be used to run the function instead of a dedicated thread. The *name* and *daemon* parameters will be ignored.
 
+   The *channel* parameter routes the decorated function to a named workload channel of the provided *pool*. It is ignored if *pool* is not set.
+
 
 `Pebble Module`
 ---------------
 
+.. _pebble.ChannelConfig:
+.. class:: pebble.ChannelConfig(max_concurrency=None, weight=1)
+
+   Defines the configuration of a named workload channel.
+
+   *max_concurrency* is an integer limiting the amount of tasks belonging to the channel which are allowed to be dispatched but not yet completed at any given time. If None, the channel is only bounded by the Pool *max_workers*.
+
+   *weight* is a positive integer controlling the share of workers assigned to the channel once multiple channels have tasks ready to run. A channel with weight 3 is served three times as often as a channel with weight 1 within each scheduling round.
+
 .. _pebble.ProcessPool:
-.. class:: pebble.ProcessPool(max_workers=multiprocessing.cpu_count(), max_tasks=0, initializer=None, initargs=None, context=None)
+.. class:: pebble.ProcessPool(max_workers=multiprocessing.cpu_count(), max_tasks=0, initializer=None, initargs=None, context=None, channels=None)
 
    A Pool allows to schedule jobs into a Pool of Processes which will perform them concurrently.
    Process pools work as well as a *context manager*.
@@ -93,11 +110,13 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
 
    The *context* parameter can be used to specify the multiprocessing.context_ object used for starting the worker processes.
 
+   The optional *channels* parameter accepts a mapping of channel names to pebble.ChannelConfig_ objects configuring the named workload channels handled by the Pool. See the `Workload channels`_ section.
+
    .. data:: active
 
       True if the Pool is running, false otherwise.
 
-   .. function:: schedule(function, args=(), kwargs={}, timeout=None)
+   .. function:: schedule(function, args=(), kwargs={}, timeout=None, channel=None)
 
       Schedule the function to be executed within the Pool.
 
@@ -109,7 +128,7 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
 
       *timeout* can be None, an integer or a float. Once expired, it will force the timed out task to be interrupted and the worker will be restarted. *Future.result()* will raise *TimeoutError*, callbacks will be executed.
 
-   .. function:: map(function, *iterables, chunksize=1, timeout=None)
+   .. function:: map(function, *iterables, chunksize=1, timeout=None, channel=None)
 
       Concurrently compute the *function* using arguments from each of the iterables.
       Stop when the shortest iterable is exhausted.
@@ -118,6 +137,8 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
 
       *timeout* is an integer or a float. If given, it will be assigned to each chunk of the iterables.
       If the computation of the given chunk will last longer than *timeout*, its execution will be terminated. Iterating over its result will raise *TimeoutError*, all computations over the chunk will be lost.
+
+      If *channel* is given, all the chunks are routed to the matching named workload channel.
 
       A pebble.ProcessMapFuture_ object is returned. Its *result* method will return an iterable containing the results of the computation in the same order as they were given.
 
@@ -139,7 +160,7 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
       The *join* function must be called only in the main loop. Calling it in a pebble.ProcessFuture_ callback will result in a deadlock.
 
 .. _pebble.ThreadPool:
-.. class:: pebble.ThreadPool(max_workers=multiprocessing.cpu_count(), max_tasks=0, initializer=None, initargs=None)
+.. class:: pebble.ThreadPool(max_workers=multiprocessing.cpu_count(), max_tasks=0, initializer=None, initargs=None, channels=None)
 
    A ThreadPool allows to schedule jobs into a Pool of Threads which will perform them concurrently.
    Thread pools work as well as a *context manager*.
@@ -147,11 +168,13 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
    *max_workers* is an integer representing the amount of desired process workers managed by the pool. If *max_tasks* is a number greater than zero, each worker will be restarted after performing an equal amount of tasks.
    *initializer* must be callable, if passed, it will be called every time a worker is started, receiving *initargs* as arguments.
 
+   The optional *channels* parameter accepts a mapping of channel names to pebble.ChannelConfig_ objects configuring the named workload channels handled by the Pool. See the `Workload channels`_ section.
+
    .. data:: active
 
       True if the Pool is running, false otherwise.
 
-   .. function:: schedule(function, args=(), kwargs={})
+   .. function:: schedule(function, args=(), kwargs={}, channel=None)
 
       Schedule the function to be executed within the Pool.
 
@@ -161,7 +184,9 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
 
       *args* and *kwargs* will be passed to the function respectively as its arguments and keyword arguments.
 
-   .. function:: map(function, *iterables, chunksize=1)
+      *channel* optionally routes the task to a named workload channel configured at Pool construction.
+
+   .. function:: map(function, *iterables, chunksize=1, channel=None)
 
       Concurrently compute the *function* using arguments from each of the iterables.
       Stop when the shortest iterable is exhausted.
@@ -170,6 +195,8 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
 
       *timeout* is an integer or a float. If given, it will be assigned to every chunk of the iterables.
       If the computation of the given chunk will last longer than *timeout*, iterating over its result will raise *TimeoutError*.
+
+      If *channel* is given, all the chunks are routed to the matching named workload channel.
 
       A pebble.MapFuture_ object is returned. Its *result* method will return an iterable containing the results of the computation in the same order as they were given.
 
@@ -508,6 +535,36 @@ The `concurrent` and `asynchronous` decorators accept a *pool* parameter. This i
 
     wait(futures)
 
+
+Workload channels
++++++++++++++++++
+
+Pools accept optional, named workload channels through the *channels* parameter, a mapping of channel names to pebble.ChannelConfig_ objects. Each channel defines a *max_concurrency* limit and a *weight*.
+
+Tasks are routed to a channel via the *channel* parameter of *schedule*, *map* or of the *concurrent*/*asynchronous* decorators. Tasks without a channel are routed to a default channel which is only bounded by the Pool amount of workers. Scheduling a task on an undeclared channel raises a *ValueError*.
+
+The scheduler dispatches the ready tasks with a weighted round robin discipline. A channel continuously submitting tasks cannot therefore starve the other ready channels, while the per-channel concurrency limit is always honored. The channel assignment is a property of the task and is preserved across cancellation, *map* chunking, decorators and worker restarts.
+
+::
+
+    from pebble import ProcessPool, ChannelConfig
+
+    def process_data(identifier):
+        return identifier
+
+    with ProcessPool(
+        max_workers=4,
+        channels={
+            # at most one ingestion task at a time, low scheduling weight
+            "ingestion": ChannelConfig(max_concurrency=1, weight=1),
+            # up to two analysis tasks, served three times more often
+            "analysis": ChannelConfig(max_concurrency=2, weight=3),
+        },
+    ) as pool:
+        ingestion = pool.schedule(process_data, args=[1], channel="ingestion")
+        analysis = pool.map(
+            process_data, range(100), channel="analysis"
+        )
 
 Pools and AsyncIO
 +++++++++++++++++
