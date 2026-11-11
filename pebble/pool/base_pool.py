@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 import logging
 import itertools
@@ -30,6 +31,8 @@ from typing import Any, Callable, Generic, Iterable
 
 from pebble.common.types import T
 from pebble.common import Result, ResultStatus, ProcessFuture, CONSTS
+from pebble.pool.receipt import DEFAULT_CHANNEL, ReceiptEvent, ReceiptPolicy
+from pebble.pool.receipt import ReceiptRecord, ReceiptStore, emit_receipt
 
 
 class BasePool:
@@ -39,12 +42,77 @@ class BasePool:
         max_tasks: int,
         initializer: Callable | None,
         initargs: Iterable[Any],
+        receipts: bool = False,
+        receipt_policy: ReceiptPolicy | None = None,
     ):
         self._context: PoolContext = PoolContext(
             max_workers, max_tasks, initializer, initargs
         )
+        if receipts:
+            self._context.receipt_store = ReceiptStore(
+                self._pool_kind(), policy=receipt_policy
+            )
         self._loops: Iterable[Any] = ()
         self._task_counter: itertools.count = itertools.count()
+
+    def _pool_kind(self) -> str:
+        raise NotImplementedError("Not implemented")
+
+    @property
+    def receipts_enabled(self) -> bool:
+        """Whether the task execution receipts are being collected."""
+        return self._context.receipt_store is not None
+
+    def receipts(
+        self,
+        task_id: int | None = None,
+        channel: str | None = None,
+    ) -> tuple[ReceiptRecord, ...]:
+        """Query the collected receipt records.
+
+        Filter by ``task_id`` or by ``channel``. When neither is provided,
+        all the records collected within the Pool lifecycle are returned.
+        Records are always ordered by their sequence number.
+
+        """
+        store = self._require_receipt_store()
+
+        if task_id is not None and channel is not None:
+            raise ValueError("Query the receipts by task_id or by channel, not both")
+        if task_id is not None:
+            return store.for_task(task_id)
+        if channel is not None:
+            return store.for_channel(channel)
+
+        return store.records()
+
+    def export_receipts(self, path: str | os.PathLike[str] | None = None) -> str:
+        """Export the receipts as a deterministic JSON document.
+
+        The Pool must be closed or stopped before exporting.
+        If ``path`` is provided, the document is also written to the file.
+
+        """
+        store = self._require_receipt_store()
+
+        if self._context.status == PoolStatus.RUNNING:
+            raise RuntimeError("Close the Pool before exporting the receipts")
+
+        document: str = store.to_json(self._context.status.name.lower())
+
+        if path is not None:
+            with open(path, "w", encoding="utf-8") as file:
+                file.write(document)
+
+        return document
+
+    def _require_receipt_store(self) -> ReceiptStore:
+        store = self._context.receipt_store
+
+        if store is None:
+            raise RuntimeError("Task receipts are not enabled for this Pool")
+
+        return store
 
     def __enter__(self: PoolT) -> PoolT:
         return self
@@ -85,6 +153,7 @@ class BasePool:
         else:
             self._context.task_queue.put(None)  # Pool termination sentinel
             self._stop_pool()
+            emit_receipt(self._context, ReceiptEvent.POOL_STOPPED)
 
     def _wait_queue_depletion(self, timeout: float | None):
         tick: float = time.time()
@@ -135,6 +204,7 @@ class PoolContext:
         self.workers: int = max_workers
         self.task_counter: itertools.count = itertools.count()
         self.worker_parameters: Worker = Worker(max_tasks, initializer, initargs)
+        self.receipt_store: ReceiptStore | None = None
 
     @property
     def status(self) -> PoolStatus:
@@ -158,11 +228,14 @@ class Task:
         future: Future,
         timeout: float | None,
         payload: TaskPayload,
+        channel: str = DEFAULT_CHANNEL,
     ):
         self.id: int = identifier
         self.future: Future = future
         self.timeout: float | None = timeout
         self.payload: TaskPayload = payload
+        self.channel: str = channel
+        self.attempt: int = 0
         self.timestamp: float = 0.0
         self.worker_id: int = 0
 

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import time
+import threading
 import multiprocessing
 
 from queue import Queue
@@ -31,6 +32,8 @@ from pebble.pool.base_pool import iter_chunks, run_initializer
 from pebble.pool.base_pool import MapResults, Worker, Result
 from pebble.pool.base_pool import PoolStatus, MapFuture, map_results
 from pebble.pool.base_pool import PoolContext, BasePool, Task, TaskPayload
+from pebble.pool.receipt import ReceiptEvent, ReceiptOutcome, ReceiptPolicy
+from pebble.pool.receipt import emit_receipt, outcome_of, validate_channel
 
 
 class ThreadPool(BasePool):
@@ -52,10 +55,22 @@ class ThreadPool(BasePool):
         max_tasks: int = 0,
         initializer: Callable | None = None,
         initargs: Iterable[Any] = (),
+        receipts: bool = False,
+        receipt_policy: ReceiptPolicy | None = None,
     ):
-        super().__init__(max_workers, max_tasks, initializer, initargs)
+        super().__init__(
+            max_workers,
+            max_tasks,
+            initializer,
+            initargs,
+            receipts=receipts,
+            receipt_policy=receipt_policy,
+        )
         self._pool_manager: PoolManager = PoolManager(self._context)
         self._pool_manager_loop: Thread | None = None
+
+    def _pool_kind(self) -> str:
+        return "thread"
 
     def _start_pool(self):
         with self._context.status_mutex:
@@ -67,6 +82,7 @@ class ThreadPool(BasePool):
                 self._loops = (self._pool_manager_loop,)
 
                 self._context.status = PoolStatus.RUNNING
+                emit_receipt(self._context, ReceiptEvent.POOL_STARTED)
 
     def _stop_pool(self):
         if self._pool_manager_loop is not None:
@@ -78,20 +94,35 @@ class ThreadPool(BasePool):
         function: Callable[..., T],
         args: Iterable[Any] = (),
         kwargs: Mapping[str, Any] = {},
+        channel: str | None = None,
     ) -> Future[T]:
         """Schedules *function* to be run the Pool.
 
         *args* and *kwargs* will be forwareded to the scheduled function
         respectively as arguments and keyword arguments.
 
+        *channel* is an optional label grouping the task receipts so they
+        can be queried through ``Pool.receipts(channel=...)``.
+
         A *concurrent.futures.Future* object is returned.
 
         """
         self._check_pool_status()
 
+        task_channel: str = validate_channel(channel)
         future: Future = Future()
         payload: TaskPayload = TaskPayload(function, args, kwargs)
-        task: Task = Task(next(self._task_counter), future, None, payload)
+        task: Task = Task(
+            next(self._task_counter), future, None, payload, channel=task_channel
+        )
+
+        emit_receipt(
+            self._context,
+            ReceiptEvent.SUBMITTED,
+            task_id=task.id,
+            channel=task_channel,
+            function=function,
+        )
 
         self._context.task_queue.put(task)
 
@@ -191,8 +222,18 @@ def worker_thread(context: PoolContext):
             return
 
     for task in get_next_task(context, parameters.max_tasks):
-        execute_next_task(task)
+        execute_next_task(context, task)
         queue.task_done()
+        emit_receipt(
+            context,
+            ReceiptEvent.RESOURCE_RELEASED,
+            task_id=task.id,
+            channel=task.channel,
+            attempt=task.attempt,
+            function=task.payload.function,
+            worker_id=threading.get_ident(),
+            reason="queue_slot",
+        )
 
 
 def get_next_task(context: PoolContext, max_tasks: int):
@@ -205,15 +246,43 @@ def get_next_task(context: PoolContext, max_tasks: int):
         if task is not None:
             if task.future.cancelled():
                 task.set_running_or_notify_cancel()
+                emit_receipt(
+                    context,
+                    ReceiptEvent.TERMINAL,
+                    task_id=task.id,
+                    channel=task.channel,
+                    function=task.payload.function,
+                    outcome=ReceiptOutcome.CANCELLED.value,
+                    reason="cancelled_before_start",
+                )
+                emit_receipt(
+                    context,
+                    ReceiptEvent.RESOURCE_RELEASED,
+                    task_id=task.id,
+                    channel=task.channel,
+                    function=task.payload.function,
+                    reason="queue_slot",
+                )
                 queue.task_done()
             else:
                 yield task
 
 
-def execute_next_task(task: Task):
+def execute_next_task(context: PoolContext, task: Task):
     payload: TaskPayload = task.payload
     task.timestamp = time.time()
+    task.attempt += 1
     task.set_running_or_notify_cancel()
+
+    emit_receipt(
+        context,
+        ReceiptEvent.STARTED,
+        task_id=task.id,
+        channel=task.channel,
+        attempt=task.attempt,
+        function=payload.function,
+        worker_id=threading.get_ident(),
+    )
 
     result: Result = execute(payload.function, *payload.args, **payload.kwargs)
 
@@ -221,6 +290,18 @@ def execute_next_task(task: Task):
         task.future.set_result(result.value)
     else:
         task.future.set_exception(result.value)
+
+    emit_receipt(
+        context,
+        ReceiptEvent.TERMINAL,
+        task_id=task.id,
+        channel=task.channel,
+        attempt=task.attempt,
+        function=payload.function,
+        worker_id=threading.get_ident(),
+        outcome=outcome_of(result),
+        error=None if result.status == ResultStatus.SUCCESS else result.value,
+    )
 
 
 def process_chunk(function: Callable, chunk: list) -> list:

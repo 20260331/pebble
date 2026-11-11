@@ -38,6 +38,8 @@ from pebble.pool.base_pool import Worker, iter_chunks, run_initializer
 from pebble.pool.base_pool import PoolContext, BasePool, Task, TaskPayload
 from pebble.pool.base_pool import MapResults
 from pebble.pool.base_pool import PoolStatus, ProcessMapFuture, map_results
+from pebble.pool.receipt import ReceiptEvent, ReceiptOutcome, ReceiptPolicy
+from pebble.pool.receipt import emit_receipt, outcome_of, validate_channel
 from pebble.common import Result, ResultStatus, CONSTS
 from pebble.common import ProcessExpired, ProcessFuture
 from pebble.common.types import MultiprocessingContext, P, T
@@ -68,12 +70,24 @@ class ProcessPool(BasePool):
         initializer: Callable | None = None,
         initargs: Iterable[Any] = (),
         context: MultiprocessingContext = multiprocessing,
+        receipts: bool = False,
+        receipt_policy: ReceiptPolicy | None = None,
     ):
-        super().__init__(max_workers, max_tasks, initializer, initargs)
+        super().__init__(
+            max_workers,
+            max_tasks,
+            initializer,
+            initargs,
+            receipts=receipts,
+            receipt_policy=receipt_policy,
+        )
         self._pool_manager: PoolManager = PoolManager(self._context, context)
         self._task_scheduler_loop: Thread | None = None
         self._pool_manager_loop: Thread | None = None
         self._message_manager_loop: Thread | None = None
+
+    def _pool_kind(self) -> str:
+        return "process"
 
     def _start_pool(self):
         with self._context.status_mutex:
@@ -96,6 +110,7 @@ class ProcessPool(BasePool):
                 )
 
                 self._context.status = PoolStatus.RUNNING
+                emit_receipt(self._context, ReceiptEvent.POOL_STARTED)
 
     def _stop_pool(self):
         if self._pool_manager_loop is not None:
@@ -112,6 +127,7 @@ class ProcessPool(BasePool):
         args: Iterable[Any] = (),
         kwargs: Mapping[str, Any] = {},
         timeout: float | None = None,
+        channel: str | None = None,
     ) -> ProcessFuture[T]:
         """Schedules *function* to be run the Pool.
 
@@ -121,14 +137,28 @@ class ProcessPool(BasePool):
         *timeout* is an integer, if expires the task will be terminated
         and *Future.result()* will raise *TimeoutError*.
 
+        *channel* is an optional label grouping the task receipts so they
+        can be queried through ``Pool.receipts(channel=...)``.
+
         A *pebble.ProcessFuture* object is returned.
 
         """
         self._check_pool_status()
 
+        task_channel: str = validate_channel(channel)
         future: ProcessFuture = ProcessFuture()
         payload: TaskPayload = TaskPayload(function, args, kwargs)
-        task: Task = Task(next(self._task_counter), future, timeout, payload)
+        task: Task = Task(
+            next(self._task_counter), future, timeout, payload, channel=task_channel
+        )
+
+        emit_receipt(
+            self._context,
+            ReceiptEvent.SUBMITTED,
+            task_id=task.id,
+            channel=task_channel,
+            function=function,
+        )
 
         self._context.task_queue.put(task)
 
@@ -194,6 +224,23 @@ def task_scheduler_loop(pool_manager: PoolManager):
             if task is not None:
                 if task.future.cancelled():
                     task.set_running_or_notify_cancel()
+                    emit_receipt(
+                        pool_manager.context,
+                        ReceiptEvent.TERMINAL,
+                        task_id=task.id,
+                        channel=task.channel,
+                        function=task.payload.function,
+                        outcome=ReceiptOutcome.CANCELLED.value,
+                        reason="cancelled_before_dispatch",
+                    )
+                    emit_receipt(
+                        pool_manager.context,
+                        ReceiptEvent.RESOURCE_RELEASED,
+                        task_id=task.id,
+                        channel=task.channel,
+                        function=task.payload.function,
+                        reason="queue_slot",
+                    )
                     task_queue.task_done()
                 else:
                     pool_manager.schedule(task)
@@ -225,7 +272,7 @@ class PoolManager:
 
     def __init__(self, context: PoolContext, mp_context: MultiprocessingContext):
         self.context: PoolContext = context
-        self.task_manager: TaskManager = TaskManager(context.task_queue.task_done)
+        self.task_manager: TaskManager = TaskManager(context)
         self.worker_manager: WorkerManager = WorkerManager(
             context.workers, context.worker_parameters, mp_context
         )
@@ -236,6 +283,7 @@ class PoolManager:
 
     def stop(self):
         self.worker_manager.close_channels()
+        emit_receipt(self.context, ReceiptEvent.CHANNEL_CLOSED)
         self.worker_manager.force_stop_workers()
 
     def schedule(self, task: Task):
@@ -270,6 +318,7 @@ class PoolManager:
         """Handle tasks which reached timeout."""
         for task in self.task_manager.timeout_tasks():
             if self.worker_manager.maybe_stop_worker(task.worker_id):
+                self._worker_replaced(task, "timeout")
                 self.task_manager.task_done(
                     task.id,
                     Result(
@@ -281,6 +330,7 @@ class PoolManager:
         """Handle tasks which have been cancelled."""
         for task in self.task_manager.cancelled_tasks():
             if self.worker_manager.maybe_stop_worker(task.worker_id):
+                self._worker_replaced(task, "cancelled")
                 self.task_manager.task_done(
                     task.id, Result(ResultStatus.FAILURE, CancelledError())
                 )
@@ -295,6 +345,7 @@ class PoolManager:
         """
         for task in self.task_manager.running_tasks():
             if task.worker_id not in self.worker_manager.workers:
+                self._worker_replaced(task, "orphaned")
                 error = ProcessExpired("Abnormal termination", pid=task.worker_id)
                 self.task_manager.task_done(task.id, Result(ResultStatus.ERROR, error))
 
@@ -313,8 +364,21 @@ class PoolManager:
         except LookupError:
             return
         else:
+            self._worker_replaced(task, "expired", worker_id=worker_id)
             error = ProcessExpired("Abnormal termination", code=exitcode, pid=worker_id)
             self.task_manager.task_done(task.id, Result(ResultStatus.ERROR, error))
+
+    def _worker_replaced(self, task: Task, reason: str, worker_id: int | None = None):
+        emit_receipt(
+            self.context,
+            ReceiptEvent.WORKER_REPLACED,
+            task_id=task.id,
+            channel=task.channel,
+            attempt=task.attempt,
+            function=task.payload.function,
+            worker_id=worker_id if worker_id is not None else task.worker_id,
+            reason=reason,
+        )
 
     def find_expired_task(self, worker_id: int) -> Task:
         tasks = dictionary_values(self.task_manager.tasks)
@@ -336,9 +400,10 @@ class TaskManager:
     Timing out and cancelled tasks are handled as well.
     """
 
-    def __init__(self, task_done_callback: Callable):
+    def __init__(self, context: PoolContext):
+        self.context: PoolContext = context
         self.tasks: Dict[int, Task] = {}
-        self.task_done_callback: Callable = task_done_callback
+        self.task_done_callback: Callable = context.task_queue.task_done
 
     def register(self, task: Task):
         self.tasks[task.id] = task
@@ -353,6 +418,18 @@ class TaskManager:
             task.timestamp = time.time()
             task.set_running_or_notify_cancel()
 
+            if worker_id is not None:  # worker acknowledgement, not dispatch issue
+                task.attempt += 1
+                emit_receipt(
+                    self.context,
+                    ReceiptEvent.STARTED,
+                    task_id=task.id,
+                    channel=task.channel,
+                    attempt=task.attempt,
+                    function=task.payload.function,
+                    worker_id=worker_id,
+                )
+
     def task_done(self, task_id: int, result: Result):
         """Set the tasks result and run the callback."""
         try:
@@ -366,6 +443,28 @@ class TaskManager:
                 task.future.set_result(result.value)
             else:
                 task.future.set_exception(result.value)
+
+            emit_receipt(
+                self.context,
+                ReceiptEvent.TERMINAL,
+                task_id=task.id,
+                channel=task.channel,
+                attempt=task.attempt,
+                function=task.payload.function,
+                worker_id=task.worker_id or None,
+                outcome=outcome_of(result),
+                error=None if result.status == ResultStatus.SUCCESS else result.value,
+            )
+            emit_receipt(
+                self.context,
+                ReceiptEvent.RESOURCE_RELEASED,
+                task_id=task.id,
+                channel=task.channel,
+                attempt=task.attempt,
+                function=task.payload.function,
+                worker_id=task.worker_id or None,
+                reason="queue_slot",
+            )
 
             self.task_done_callback()
 
