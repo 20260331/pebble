@@ -109,7 +109,7 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
 
       *timeout* can be None, an integer or a float. Once expired, it will force the timed out task to be interrupted and the worker will be restarted. *Future.result()* will raise *TimeoutError*, callbacks will be executed.
 
-   .. function:: map(function, *iterables, chunksize=1, timeout=None)
+   .. function:: map(function, *iterables, chunksize=1, timeout=None, lease=None)
 
       Concurrently compute the *function* using arguments from each of the iterables.
       Stop when the shortest iterable is exhausted.
@@ -118,6 +118,8 @@ Pebble aims to help managing threads and processes in an easier way. It wraps Py
 
       *timeout* is an integer or a float. If given, it will be assigned to each chunk of the iterables.
       If the computation of the given chunk will last longer than *timeout*, its execution will be terminated. Iterating over its result will raise *TimeoutError*, all computations over the chunk will be lost.
+
+      *lease* is an optional integer or float representing, in seconds, for how long the consumer is allowed to hold the results of the map. The lease starts once the results are consumed and can be renewed via the *renew_lease* method of the returned future or of its result iterator. If the lease expires or the consumer abandons the iteration by calling the iterator *close* method, the not yet started tasks are cancelled, the running ones are handled according to the Pool cancellation semantics and the results and their buffers are released. Each map owns an independent lease, different maps do not affect each other.
 
       A pebble.ProcessMapFuture_ object is returned. Its *result* method will return an iterable containing the results of the computation in the same order as they were given.
 

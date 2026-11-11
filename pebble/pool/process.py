@@ -36,8 +36,9 @@ from typing import Any, Callable, Dict, Mapping, Iterable, Iterator, List, Tuple
 from pebble.pool.channel import Channel, WorkerChannel, channels
 from pebble.pool.base_pool import Worker, iter_chunks, run_initializer
 from pebble.pool.base_pool import PoolContext, BasePool, Task, TaskPayload
-from pebble.pool.base_pool import MapResults
+from pebble.pool.base_pool import MapResults, MapLease
 from pebble.pool.base_pool import PoolStatus, ProcessMapFuture, map_results
+from pebble.pool.base_pool import validate_lease
 from pebble.common import Result, ResultStatus, CONSTS
 from pebble.common import ProcessExpired, ProcessFuture
 from pebble.common.types import MultiprocessingContext, P, T
@@ -155,7 +156,8 @@ class ProcessPool(BasePool):
         function: Callable[..., T],
         *iterables: Iterable[Any],
         timeout: float | None = None,
-        chunksize: int = 1
+        chunksize: int = 1,
+        lease: float | None = None,
     ) -> ProcessMapFuture[MapResults[T]]:
         """Computes the *function* using arguments from
         each of the iterables. Stops when the shortest iterable is exhausted.
@@ -167,6 +169,14 @@ class ProcessPool(BasePool):
         *chunksize* controls the size of the chunks the iterable will
         be broken into before being passed to the function.
 
+        *lease* is an optional float representing the amount of seconds
+        the consumer of the map results is allowed to hold the batch.
+        The lease starts once the results are consumed and can be
+        renewed through the *ProcessMapFuture.renew_lease* method.
+        On expiry or early abandonment, the not yet started tasks are
+        cancelled, the running ones follow the Pool cancellation
+        semantics and the result buffers are released.
+
         A *pebble.ProcessFuture* object is returned.
 
         """
@@ -174,12 +184,17 @@ class ProcessPool(BasePool):
 
         if chunksize < 1:
             raise ValueError("chunksize must be >= 1")
+        validate_lease(lease)
 
         futures: List[ProcessFuture] = [
             self.schedule(process_chunk, args=(function, chunk), timeout=timeout)
             for chunk in iter_chunks(zip(*iterables), chunksize)
         ]
-        future: ProcessMapFuture = ProcessMapFuture(futures)
+        map_lease: MapLease | None = (
+            MapLease(lease, futures) if lease is not None else None
+        )
+        future: ProcessMapFuture = ProcessMapFuture(futures, lease=map_lease)
+        self._context.leases.register(future)
 
         return map_results(future, timeout)
 
@@ -260,6 +275,7 @@ class PoolManager:
     def update_status(self):
         self.update_tasks()
         self.update_workers()
+        self.context.leases.update()
 
     def update_tasks(self):
         self.handle_timeout_tasks()

@@ -1,6 +1,8 @@
+import gc
 import os
 import sys
 import time
+import weakref
 import pickle
 import signal
 import asyncio
@@ -99,6 +101,12 @@ def pickle_error_function():
 def long_function(value=1):
     time.sleep(value)
     return value
+
+
+def lease_queue_function(queue):
+    queue.put(1)
+    time.sleep(0.3)
+    return queue
 
 
 def pid_function():
@@ -619,6 +627,162 @@ class TestProcessPool(unittest.TestCase):
                     break
                 except StopIteration:
                     break
+
+    def test_process_pool_map_lease(self):
+        """Process Pool Forkserver map lease releases the buffers once consumed."""
+        elements = list(range(4))
+
+        with ProcessPool(max_workers=2, context=mp_context) as pool:
+            future = pool.map(function, elements, lease=1)
+            generator = future.result()
+
+            self.assertTrue(future.lease.active)
+            self.assertEqual(list(generator), elements)
+            self.assertTrue(future.lease.released)
+            self.assertEqual(future.futures, ())
+            self.assertIsNone(generator._results)
+
+    def test_process_pool_map_lease_renew(self):
+        """Process Pool Forkserver map lease can be renewed while consuming."""
+        with ProcessPool(max_workers=2, context=mp_context) as pool:
+            future = pool.map(function, range(5), lease=0.3)
+            generator = future.result()
+            first_deadline = future.renew_lease()
+            time.sleep(0.2)
+            second_deadline = generator.renew_lease()
+            self.assertGreater(second_deadline, first_deadline)
+            time.sleep(0.2)
+            self.assertFalse(future.lease.released)
+            self.assertEqual(list(generator), list(range(5)))
+
+    def test_process_pool_map_lease_renew_timeout(self):
+        """Process Pool Forkserver lease renewal accepts a new timeout."""
+        with ProcessPool(max_workers=1, context=mp_context) as pool:
+            future = pool.map(function, range(2), lease=10)
+            generator = future.result()
+            deadline = generator.renew_lease(0.2)
+            self.assertLess(deadline - time.monotonic(), 0.25)
+            time.sleep(0.4)
+            with self.assertRaises(CancelledError):
+                next(generator)
+            self.assertTrue(future.lease.released)
+
+    def test_process_pool_map_lease_expiration(self):
+        """Process Pool Forkserver lease expiration cancels the batch and buffers."""
+        with ProcessPool(max_workers=1, context=mp_context) as pool:
+            future = pool.map(long_function, [1] * 5, lease=0.2)
+            chunk_futures = list(future.futures)
+            generator = future.result()
+
+            self.assertTrue(any(f.cancelled() for f in chunk_futures))
+            with self.assertRaises(CancelledError):
+                next(generator)
+            self.assertIsNone(generator._results)
+            self.assertEqual(future.futures, ())
+            self.assertTrue(future.lease.released)
+            time.sleep(0.3)
+            self.assertEqual(pool._context.leases._entries, [])
+
+    def test_process_pool_map_lease_close(self):
+        """Process Pool Forkserver abandoning the iterator cancels the batch."""
+        with ProcessPool(max_workers=2, context=mp_context) as pool:
+            future = pool.map(function, range(6), lease=5)
+            generator = future.result()
+            self.assertEqual(next(generator), 0)
+            generator.close()
+            with self.assertRaises(CancelledError):
+                next(generator)
+            self.assertIsNone(generator._results)
+            self.assertEqual(future.futures, ())
+            self.assertTrue(future.lease.released)
+            time.sleep(0.3)
+            self.assertEqual(pool._context.leases._entries, [])
+
+    def test_process_pool_map_lease_cancel(self):
+        """Process Pool Forkserver cancelling a leased map releases the lease."""
+        with ProcessPool(max_workers=1, context=mp_context) as pool:
+            future = pool.map(long_function, [1] * 5, lease=5)
+            chunk_futures = list(future.futures)
+
+            def abandon():
+                time.sleep(0.2)
+                future.cancel()
+
+            thread = threading.Thread(target=abandon)
+            thread.start()
+            generator = future.result()
+            thread.join()
+            self.assertTrue(any(f.cancelled() for f in chunk_futures))
+            with self.assertRaises(CancelledError):
+                next(generator)
+            self.assertTrue(future.lease.released)
+
+    def test_process_pool_map_lease_context_manager(self):
+        """Process Pool Forkserver map results support the context manager protocol."""
+        with ProcessPool(max_workers=1, context=mp_context) as pool:
+            future = pool.map(function, range(4), lease=5)
+            with future.result() as generator:
+                self.assertEqual(next(generator), 0)
+            self.assertTrue(future.lease.released)
+            with self.assertRaises(CancelledError):
+                next(generator)
+
+    def test_process_pool_map_lease_isolation(self):
+        """Process Pool Forkserver leases of different maps do not affect each other."""
+        with ProcessPool(max_workers=2, context=mp_context) as pool:
+            abandoned = pool.map(function, range(10), lease=0.2)
+            active = pool.map(function, range(5), lease=5)
+            abandoned.result()
+            time.sleep(0.5)
+            self.assertTrue(abandoned.lease.released)
+            self.assertFalse(active.lease.released)
+            entries = pool._context.leases._entries
+            self.assertEqual(len(entries), 1)
+            self.assertIs(entries[0][0], active.lease)
+            generator = active.result()
+            active.renew_lease()
+            self.assertEqual(list(generator), list(range(5)))
+
+    def test_process_pool_map_lease_garbage_collection(self):
+        """Process Pool Forkserver abandoned leased maps are collected and cancelled."""
+        manager = mp_context.Manager()
+        queue = manager.Queue()
+        try:
+            with ProcessPool(max_workers=1, context=mp_context) as pool:
+                future = pool.map(
+                    lease_queue_function, [queue] * 8, lease=10
+                )
+                reference = weakref.ref(future)
+                del future
+                gc.collect()
+                self.assertIsNone(reference())
+                deadline = time.time() + 3
+                while time.time() < deadline and pool._context.leases._entries:
+                    time.sleep(0.05)
+                self.assertEqual(pool._context.leases._entries, [])
+                self.assertLessEqual(queue.qsize(), 1)
+        finally:
+            manager.shutdown()
+
+    def test_process_pool_map_lease_invalid(self):
+        """Process Pool Forkserver map lease parameter is validated."""
+        with ProcessPool(max_workers=1, context=mp_context) as pool:
+            with self.assertRaises(ValueError):
+                pool.map(function, [1], lease=0)
+            with self.assertRaises(TypeError):
+                pool.map(function, [1], lease="1")
+            future = pool.map(function, [1])
+            with self.assertRaises(RuntimeError):
+                future.renew_lease()
+
+    def test_process_pool_map_lease_shutdown(self):
+        """Process Pool Forkserver shutdown releases the map leases."""
+        pool = ProcessPool(max_workers=1, context=mp_context)
+        future = pool.map(function, range(3), lease=5)
+        pool.close()
+        pool.join()
+        self.assertTrue(future.lease.released)
+        self.assertEqual(future.futures, ())
 
     def test_process_pool_child_process(self):
         """Process Pool Forkserver worker starts process."""

@@ -28,9 +28,10 @@ from typing import Any, Callable, Mapping, Iterable, List
 from pebble.common import ResultStatus, execute, launch_thread, CONSTS
 from pebble.common.types import P, T
 from pebble.pool.base_pool import iter_chunks, run_initializer
-from pebble.pool.base_pool import MapResults, Worker, Result
+from pebble.pool.base_pool import MapResults, Worker, Result, MapLease
 from pebble.pool.base_pool import PoolStatus, MapFuture, map_results
 from pebble.pool.base_pool import PoolContext, BasePool, Task, TaskPayload
+from pebble.pool.base_pool import validate_lease
 
 
 class ThreadPool(BasePool):
@@ -113,7 +114,8 @@ class ThreadPool(BasePool):
         function: Callable[..., T],
         *iterables: Iterable[Any],
         timeout: float | None = None,
-        chunksize: int = 1
+        chunksize: int = 1,
+        lease: float | None = None,
     ) -> MapFuture[MapResults[T]]:
         """Returns an iterator equivalent to map(function, iterables).
 
@@ -121,17 +123,30 @@ class ThreadPool(BasePool):
         be broken into before being passed to the function. If None
         the size will be controlled by the Pool.
 
+        *lease* is an optional float representing the amount of seconds
+        the consumer of the map results is allowed to hold the batch.
+        The lease starts once the results are consumed and can be
+        renewed through the *MapFuture.renew_lease* method. On expiry
+        or early abandonment, the not yet started tasks are cancelled,
+        the running ones follow the Pool cancellation semantics and the
+        result buffers are released.
+
         """
         self._check_pool_status()
 
         if chunksize < 1:
             raise ValueError("chunksize must be >= 1")
+        validate_lease(lease)
 
         futures: List[Future] = [
             self.schedule(process_chunk, args=(function, chunk))
             for chunk in iter_chunks(zip(*iterables), chunksize)
         ]
-        future: MapFuture = MapFuture(futures)
+        map_lease: MapLease | None = (
+            MapLease(lease, futures) if lease is not None else None
+        )
+        future: MapFuture = MapFuture(futures, lease=map_lease)
+        self._context.leases.register(future)
 
         return map_results(future, timeout)
 
@@ -165,6 +180,7 @@ class PoolManager:
             self.join_worker(worker)
 
         self.create_workers()
+        self.context.leases.update()
 
     def inspect_workers(self) -> tuple:
         return tuple(w for w in self.workers if not w.is_alive())
